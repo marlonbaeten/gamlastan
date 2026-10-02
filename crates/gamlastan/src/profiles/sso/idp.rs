@@ -549,7 +549,7 @@ pub fn signature_template(
 /// SAML schema orders `<ds:Signature>` *after* `<saml:Issuer>` (and before
 /// `<saml:Subject>` / `<samlp:Status>`), so the template is anchored at the end of
 /// the matched element's own `<saml:Issuer>` child rather than as its first child.
-fn insert_signature_after_issuer(
+pub(crate) fn insert_signature_after_issuer(
     xml: &str,
     namespace_uri: &str,
     local_name: &str,

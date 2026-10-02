@@ -5,6 +5,28 @@ All notable changes to this repository will be documented in this file.
 The project is still pre-1.0, so minor releases may include behavior changes
 where needed to correct protocol handling.
 
+## [Unreleased]
+
+### Added
+
+- Added the `profiles::nl_eid` module: the Dienstverlener (SP) side of the
+  Dutch "Koppelvlakspecificatie eID SAML v4.4" interface to a Routeringsdienst
+  (TVS). It covers the `AuthnRequest` with the `IntendedAudience` /
+  `ServiceUUID` extension, `ArtifactResolve` and `LogoutRequest` construction
+  and signing, processing of the RD-signed SOAP `ArtifactResponse` →
+  `Response` → `Assertion` chain (signature binding, section 7.6 processing
+  rules, the section 9 algorithm allow-lists, ordered Levels of Assurance with
+  `Comparison="minimum"`, `ServiceUUID` binding, and decryption of the
+  `EncryptedID` identifiers addressed to the DV into zeroized `SubjectId`s),
+  the DV metadata document, an RD metadata reader, and `LogoutResponse`
+  validation. See ADR 0045.
+- Added `zeroize` as a direct dependency for the decrypted identifiers.
+
+### Changed
+
+- `profiles::sso::idp::insert_signature_after_issuer` is now crate-visible so
+  other profiles can splice a signature template at the schema position.
+
 ## [0.9.1] - 2026-09-29
 
 ### Changed

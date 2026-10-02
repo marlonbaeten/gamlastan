@@ -15,7 +15,8 @@
 //!   AuthzDecisionQuery support;
 //! - [`idp_discovery`] - Identity Provider Discovery/Common Domain Cookie;
 //! - [`attribute`] - SAML attribute profile helpers;
-//! - [`swedenconnect`] - Sweden Connect deployment profile additions.
+//! - [`swedenconnect`] - Sweden Connect deployment profile additions;
+//! - [`nl_eid`] - the Dutch eID SAML interface (DV ↔ Routeringsdienst / TVS).
 //!
 //! # Choosing a Layer
 //!
@@ -60,6 +61,7 @@ pub mod idp_discovery;
 pub mod logout;
 pub mod name_id_mapping;
 pub mod name_id_mgmt;
+pub mod nl_eid;
 pub mod pefim;
 pub mod session;
 pub mod sso;

@@ -39,6 +39,9 @@ bytes = { workspace = true }
 # Error handling
 thiserror = { workspace = true }
 
+# Zeroize-on-drop for decrypted personal identifiers (profiles::nl_eid)
+zeroize = { workspace = true }
+
 # Encoding
 base64 = { workspace = true }
 flate2 = { workspace = true }

@@ -30,7 +30,7 @@ The `gamlastan` crate contains the following modules:
 | `metadata` | SAML metadata types, SPID extensions, caching, and validation |
 | `bindings` | HTTP Redirect, POST, Artifact, SOAP, PAOS bindings and RelayState handling |
 | `security` | 35-check assertion validator, replay cache, clock skew handling |
-| `profiles` | Web Browser SSO (SP + IdP), SLO, ECP, artifact resolution, name ID management, Sweden Connect deployment profile |
+| `profiles` | Web Browser SSO (SP + IdP), SLO, ECP, artifact resolution, name ID management, Sweden Connect and Dutch eID deployment profiles |
 
 ## Deployment Profiles
 
@@ -41,6 +41,7 @@ profiles that layer restrictions and extensions on Web Browser SSO:
 |---------|--------|-------------|
 | Italian SPID | (built into `core`, `metadata`, `security`) | Italian public digital identity system; validated by the SPID conformance suite (see below) |
 | Sweden Connect | `profiles::swedenconnect` | [Deployment Profile for the Swedish eID Framework](https://docs.swedenconnect.se/technical-framework/latest/02_-_Deployment_Profile_for_the_Swedish_eID_Framework.html) (Sweden Connect / DIGG) |
+| Dutch eID | `profiles::nl_eid` | [Koppelvlakspecificatie eID SAML v4.4](https://tvs.dictu.nl/documentatie-en-links/koppelvlakspecificatie) (Logius): the Dienstverlener ↔ Routeringsdienst (TVS) interface to DigiD / eHerkenning / eIDAS |
 
 The `swedenconnect` module implements the Swedish eID Framework as a restriction
 and extension of Web Browser SSO, covering:
@@ -66,6 +67,36 @@ The ordinary Web Browser SSO profile is fully covered. Holder-of-key is supporte
 at the metadata/constant and `SubjectConfirmation`-method level; the mutual-TLS
 transport requirement is a deployment concern outside the library. The DSS/SAP
 `SignRequest`/`SignResponse` envelope and SAD verification are out of scope.
+
+The `nl_eid` module implements the Dienstverlener (DV, Service Provider) side
+of the Dutch eID SAML interface, whose flow is HTTP-POST `AuthnRequest` →
+HTTP-Artifact → SOAP `ArtifactResolve` → RD-signed `ArtifactResponse` with
+cleartext assertions and encrypted identifiers only:
+
+- **Levels of Assurance** -- the ordered `LevelOfAssurance` enum, the
+  `Comparison="minimum"` `RequestedAuthnContext`, and the section 7.6.3.2
+  "equal or higher" check.
+- **Deployment configuration** -- `NlEidConfig` (entityID, ServiceUUID, ACS,
+  RD entityID, minimum LoA) yields a profile-correct `SecurityConfig`.
+- **Requests** -- `AuthnRequest` with the `IntendedAudience` / `ServiceUUID`
+  extension and AD/BVD pre-selection (section 7.3), `ArtifactResolve`
+  (section 7.5), `LogoutRequest` (section 7.7.1), and enveloped RSA-SHA256
+  signing of each.
+- **Response processing** -- `process_artifact_response` verifies the RD
+  signatures (single, first, `KeyName`-selected, bound to the consumed
+  element), enforces sections 7.6.1–7.6.3.5, the section 9 algorithm
+  allow-lists, the Level of Assurance and `ServiceUUID`, and decrypts the
+  `ActingSubjectID` / `LegalSubjectID` `EncryptedID`s addressed to this DV
+  into zeroized `SubjectId`s. Cancelled and failed logins are outcomes, not
+  errors.
+- **Metadata** -- the DV SP metadata document (section 8.3) with
+  `KeyName`-named certificates, and a reader for the RD metadata (section 8.5)
+  that yields the endpoints and a `KeysManager` keyed by `KeyName`.
+- **Logout** -- `LogoutResponse` validation (section 7.7.2).
+
+The DV role is complete; the cluster-connection-provider (LC) role is not
+modelled. Trust in the RD metadata document (PKIoverheid chain, OIN), the
+mutual-TLS back-channel and the pending-request store stay with the deployment.
 
 ## Security
 
