@@ -28,6 +28,26 @@ pub fn find_child_elements<'a>(
     doc.child_elements_by_name_ns(parent, namespace_uri, local_name)
 }
 
+/// Serialize the subtree rooted at `node` as a standalone, namespace-complete
+/// XML string.
+///
+/// [`Document::node_to_xml`] treats the namespace bindings of `node`'s
+/// ancestors as already in scope and therefore does not re-declare them, so a
+/// fragment whose prefixes are declared on an ancestor (a SAML message inside
+/// a SOAP envelope, an `EncryptedID` inside an assertion) comes out with
+/// dangling prefixes. This copies the subtree into a fresh document first; the
+/// serializer then synthesizes every declaration the copied QNames need.
+/// Exclusive canonicalization ignores namespace declarations that are not
+/// visibly utilized, so the result verifies against a signature computed over
+/// the element in its original context.
+pub fn node_to_self_contained_xml(doc: &Document<'_>, node: NodeId) -> Option<String> {
+    let mut standalone: Document<'static> = Document::new();
+    let copied = standalone.import_subtree(doc, node)?;
+    let root = standalone.root();
+    standalone.append_child(root, copied);
+    Some(standalone.to_xml())
+}
+
 /// Get a required attribute from an element by local name.
 pub fn required_attribute<'a>(
     doc: &'a Document<'a>,

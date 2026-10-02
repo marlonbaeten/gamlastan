@@ -8,10 +8,15 @@
 //           … <saml:EncryptedID> …      identifiers encrypted to the DV (§7.6.3.4)
 //           <saml:Advice>               AD / BVD evidence, never consumed
 //
-// Everything is navigated on one parsed document. A sub-element whose
-// signature must be verified or whose content must be decrypted is
-// re-serialized as a standalone document (with its inherited namespace
-// declarations) only for that purpose; claims are always read from the tree.
+// Two layers, as in `profiles::swedenconnect`:
+//
+// - [`validate_response`] works on the typed [`Response`] and the signature
+//   facts the caller established, and applies every §7.6.2 / §7.6.3 rule on
+//   top of the shared `AssertionValidator`;
+// - [`process_artifact_response`] is the recommended entry point: it takes the
+//   received bytes, verifies all signatures with `SamlVerifier`, binds them to
+//   the consumed elements, deserializes the typed messages, calls
+//   [`validate_response`], and decrypts the identifiers.
 
 use chrono::{DateTime, Utc};
 use zeroize::Zeroizing;
@@ -27,7 +32,7 @@ use crate::profiles::error::ProfileError;
 use crate::profiles::sso::web_browser::{self, AuthnResult};
 use crate::security::replay::ReplayCache;
 use crate::security::validation::{AssertionValidator, ValidationParams};
-use crate::xml::deserialize::SamlDeserialize;
+use crate::xml::deserialize::{parse_saml, SamlDeserialize};
 use crate::xml::uppsala::{Document, NodeId};
 
 use super::authn_context::{validate_level_of_assurance, LevelOfAssurance};
@@ -38,7 +43,7 @@ use super::xmlutil;
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
 
-/// Correlation inputs for [`process_artifact_response`].
+/// Correlation inputs for [`process_artifact_response`] / [`validate_response`].
 pub struct ArtifactResponseParams<'a> {
     /// The `@ID` of the `ArtifactResolve` this DV sent; the ArtifactResponse
     /// `@InResponseTo` MUST equal it (§7.6.1).
@@ -49,9 +54,9 @@ pub struct ArtifactResponseParams<'a> {
     /// @InResponseTo` MUST equal it (§7.6.2, §7.6.3.3, §7.6.3.5 rule 4).
     ///
     /// Matching is done here; *consuming* the pending request ID so a replay
-    /// is refused (§9.7) stays with the embedding application, whose store
-    /// may be shared across instances. Consume it only after this function
-    /// returns an [`AuthnOutcome`].
+    /// is refused (§9.7) stays with the embedding application, whose store may
+    /// be shared across instances. Consume it only after an [`AuthnOutcome`]
+    /// was returned.
     pub expected_authn_request_id: &'a str,
 
     /// Assertion-ID replay cache (§9.7). Required: the specification mandates
@@ -209,12 +214,43 @@ impl std::fmt::Debug for SubjectId {
     }
 }
 
+/// What [`validate_response`] established about the one assertion of a
+/// successful Response.
+#[derive(Debug, Clone)]
+pub struct ValidatedAssertion {
+    /// The Subject TransientID `<saml:NameID>` (§7.6.3), needed for a later
+    /// `LogoutRequest`.
+    pub transient_name_id: String,
+    /// The delivered Level of Assurance (≥ the configured minimum).
+    pub level_of_assurance: LevelOfAssurance,
+    /// The `<saml:AuthenticatingAuthority>` entity IDs.
+    pub authenticating_authorities: Vec<String>,
+    /// The Web Browser SSO view of the assertion (issuer, session, authn
+    /// context, raw attributes: identifier attribute values are ciphertext).
+    pub authn: AuthnResult,
+}
+
+/// The typed verdict of [`validate_response`].
+#[derive(Debug, Clone)]
+pub enum ResponseVerdict {
+    /// Status `Success` and every rule satisfied.
+    Valid(Box<ValidatedAssertion>),
+    /// The user cancelled at the AD/BVD (§7.8.3).
+    Cancelled {
+        /// The Response status.
+        status: Status,
+    },
+    /// Any other non-success Response status (§7.8).
+    Failed {
+        /// The Response status.
+        status: Status,
+    },
+}
+
 /// A successful, fully validated eID authentication.
 #[derive(Debug, Clone)]
 pub struct NlEidAuthnResult {
-    /// The underlying Web Browser SSO result (issuer, session, authn context,
-    /// raw attributes). Attribute values of the identifier attributes are
-    /// ciphertext; the decrypted identities are the fields below.
+    /// The underlying Web Browser SSO result.
     pub authn: AuthnResult,
     /// The Subject TransientID `<saml:NameID>`, needed for a later
     /// `LogoutRequest` (§7.7.1).
@@ -282,93 +318,42 @@ pub fn is_cancellation_status(status: &Status) -> bool {
     authn_failed || message
 }
 
-// ── Entry point ─────────────────────────────────────────────────────────────
+// ── Typed validation (§7.6.2, §7.6.3) ───────────────────────────────────────
 
-/// Verify and process the back-channel answer to an `ArtifactResolve` (§7.6).
+/// Validate a typed `<samlp:Response>` taken from an RD-signed
+/// `ArtifactResponse` (§7.6.2, §7.6.3, §7.6.3.5).
 ///
-/// `body` is the raw SOAP 1.1 response body (a `<soap:Envelope>` carrying
-/// exactly one `<samlp:ArtifactResponse>`), or a bare `<samlp:ArtifactResponse>`
-/// document. `verifier` MUST hold only the RD signing keys from its verified
-/// metadata, each named by its `<ds:KeyName>` (see
-/// [`super::metadata::RdMetadata::keys_manager`]); `keys` are the DV's
-/// decryption keys.
+/// `verified_signed_ids` are the SAML object IDs covered by signatures a
+/// trusted [`SamlVerifier`] verified over the exact received XML (see
+/// [`process_artifact_response`], which establishes them); the consumed
+/// assertion's ID MUST be among them when it carries a signature or when
+/// [`NlEidConfig::require_assertion_signature`] is set.
+/// `response_signature_verified` is `Some(true)` only when the Response's own
+/// signature (unexpected, §7.6.2) was verified and bound.
 ///
-/// The chain is validated in this order, failing closed at the first violation:
+/// Checks, in order: `Version`, `Issuer` = RD, `Destination` = the DV ACS,
+/// `InResponseTo` = the AuthnRequest, fresh `IssueInstant`, no
+/// `EncryptedAssertion`; then the status (a failure with no assertion is a
+/// [`ResponseVerdict::Cancelled`] / [`ResponseVerdict::Failed`]); then exactly
+/// one assertion, its signature policy, the shared Web Browser SSO checklist
+/// (bearer confirmation, Recipient, InResponseTo, NotOnOrAfter, no NotBefore,
+/// Conditions window, AudienceRestriction, replay, AuthnStatement), and the
+/// eID rules: TransientID Subject, mandatory `Conditions/@NotBefore` and
+/// `@NotOnOrAfter`, exactly one `AuthnStatement` and `AttributeStatement`,
+/// fresh `AuthnInstant`, Level of Assurance ≥ minimum (§7.6.3.2).
 ///
-/// 1. §9.1 / §9.3 algorithm allow-lists over the whole document.
-/// 2. The RD signature enveloping the `ArtifactResponse`: single, first,
-///    `KeyName`-selected (§9.2), cryptographically valid, bound to the
-///    consumed element's `@ID`.
-/// 3. §7.6.1: `Version`, `Issuer` = RD, `InResponseTo` = the ArtifactResolve,
-///    fresh `IssueInstant`, `Status` = `Success`, exactly one `Response`.
-/// 4. §7.6.2: `Version`, `Issuer` = RD, `Destination` = the DV ACS,
-///    `InResponseTo` = the AuthnRequest, fresh `IssueInstant`, no
-///    `EncryptedAssertion`; a Response signature, if present, is verified and
-///    bound too. A non-success status with no assertion yields
-///    [`AuthnOutcome::Cancelled`] / [`AuthnOutcome::Failed`].
-/// 5. §7.6.3: exactly one `Assertion`; its RD signature is verified and bound
-///    (required unless [`NlEidConfig::require_assertion_signature`] is off);
-///    the shared [`AssertionValidator`] runs the Web Browser SSO checks
-///    (bearer confirmation, Recipient, InResponseTo, NotOnOrAfter, no
-///    NotBefore, Conditions window, AudienceRestriction, replay, AuthnStatement);
-///    then the eID rules: TransientID Subject, mandatory `Conditions/@NotBefore`,
-///    fresh `AuthnInstant`, Level of Assurance ≥ minimum (§7.6.3.2), exactly one
-///    `AttributeStatement` with the registered `ServiceUUID`, and the
-///    `ActingSubjectID` / `LegalSubjectID` `EncryptedID`s decrypted with the key
-///    addressed to this DV (§7.6.3.4) into §7.6.3.4.4-shaped `NameID`s.
-///
-/// Claims are read only from the outer RD assertion, never from the
-/// `<saml:Advice>` evidence (§9.1: nested signatures are evidence, not trust).
-pub fn process_artifact_response(
+/// The `ServiceUUID` and the encrypted identifiers are checked by
+/// [`process_artifact_response`], which has the document they live in.
+pub fn validate_response(
     cfg: &NlEidConfig,
-    body: &str,
-    verifier: &SamlVerifier,
-    keys: &DvDecryptionKeys,
+    response: &Response,
+    verified_signed_ids: &[&str],
+    response_signature_verified: Option<bool>,
     params: &ArtifactResponseParams<'_>,
-) -> Result<AuthnOutcome, NlEidError> {
+) -> Result<ResponseVerdict, NlEidError> {
     cfg.validate()?;
+    check_response_envelope(cfg, response, params)?;
 
-    let art_xml = extract_artifact_response_xml(body)?;
-    let doc = crate::xml::parse_secure(&art_xml)?;
-    let root = doc
-        .document_element()
-        .ok_or_else(|| NlEidError::MalformedMessage("empty document".to_string()))?;
-    if !xmlutil::is_element(&doc, root, constants::NS_SAML_PROTOCOL, "ArtifactResponse") {
-        return Err(NlEidError::MalformedMessage(
-            "back-channel body is not a samlp:ArtifactResponse".to_string(),
-        ));
-    }
-
-    // 1. Algorithms, before any cryptography.
-    xmlutil::validate_algorithms(&doc, root, Some(&cfg.entity_id))?;
-
-    // 2. The enveloping RD signature, bound to the ArtifactResponse.
-    let envelope_signature =
-        xmlutil::verify_enveloping_signature(&doc, root, &art_xml, verifier, "ArtifactResponse")?;
-    let mut signed_ids = envelope_signature.signed_ids.clone();
-
-    // 3. ArtifactResponse envelope.
-    let artifact_response = ArtifactResponseRef::from_xml(&doc, root)?.to_owned();
-    check_artifact_response(cfg, &artifact_response, params)?;
-    let response_nodes =
-        xmlutil::element_children(&doc, root, constants::NS_SAML_PROTOCOL, "Response");
-    if response_nodes.len() != 1 {
-        return Err(NlEidError::ResponseCount(response_nodes.len()));
-    }
-    let response_node = response_nodes[0];
-
-    // 4. Response envelope.
-    let response = ResponseRef::from_xml(&doc, response_node)?.to_owned();
-    check_response(cfg, &response, params)?;
-    let response_signature_verified = if response.base.has_signature {
-        let xml = xmlutil::self_contained_xml(&doc, response_node);
-        let verified =
-            xmlutil::verify_enveloping_signature(&doc, response_node, &xml, verifier, "Response")?;
-        signed_ids.extend(verified.signed_ids);
-        Some(true)
-    } else {
-        None
-    };
     if !response.base.status.is_success() {
         if !response.assertions.is_empty() {
             return Err(NlEidError::AssertionCount {
@@ -378,50 +363,30 @@ pub fn process_artifact_response(
         }
         let status = response.base.status.clone();
         return Ok(if is_cancellation_status(&status) {
-            AuthnOutcome::Cancelled { status }
+            ResponseVerdict::Cancelled { status }
         } else {
-            AuthnOutcome::Failed { status }
+            ResponseVerdict::Failed { status }
         });
     }
 
-    // 5. The assertion.
-    let assertion_nodes = xmlutil::element_children(
-        &doc,
-        response_node,
-        constants::NS_SAML_ASSERTION,
-        "Assertion",
-    );
-    if response.assertions.len() != 1 || assertion_nodes.len() != 1 {
+    let [assertion] = response.assertions.as_slice() else {
         return Err(NlEidError::AssertionCount {
             success: true,
-            found: response.assertions.len().max(assertion_nodes.len()),
+            found: response.assertions.len(),
         });
-    }
-    let assertion_node = assertion_nodes[0];
-    let assertion = &response.assertions[0];
-    if assertion.has_signature {
-        let xml = xmlutil::self_contained_xml(&doc, assertion_node);
-        let verified = xmlutil::verify_enveloping_signature(
-            &doc,
-            assertion_node,
-            &xml,
-            verifier,
-            "Assertion",
-        )?;
-        signed_ids.extend(verified.signed_ids);
-    } else if cfg.require_assertion_signature {
+    };
+    if !assertion.has_signature && cfg.require_assertion_signature {
         return Err(NlEidError::MissingSignature("Assertion"));
     }
 
     run_shared_validator(
         cfg,
-        &response,
+        response,
         params,
         response_signature_verified,
-        &signed_ids,
+        verified_signed_ids,
     )?;
     let (transient_name_id, level_of_assurance) = check_assertion(cfg, assertion, params)?;
-    let attributes = extract_identity_attributes(cfg, &doc, assertion_node, keys)?;
 
     let authn_stmt = &assertion.authn_statements[0];
     let authn = AuthnResult {
@@ -440,59 +405,12 @@ pub fn process_artifact_response(
         assertion_id: assertion.id.clone(),
         response_id: response.base.id.clone(),
     };
-
-    Ok(AuthnOutcome::Authenticated(Box::new(NlEidAuthnResult {
-        authenticating_authorities: authn.authenticating_authorities.clone(),
-        authn,
+    Ok(ResponseVerdict::Valid(Box::new(ValidatedAssertion {
         transient_name_id,
         level_of_assurance,
-        service_uuid: attributes.service_uuid,
-        acting_subject: attributes.acting_subject,
-        legal_subject: attributes.legal_subject,
-        rd_signing_key_name: envelope_signature.key_name,
+        authenticating_authorities: authn.authenticating_authorities.clone(),
+        authn,
     })))
-}
-
-// ── Steps ───────────────────────────────────────────────────────────────────
-
-/// The `<samlp:ArtifactResponse>` of a SOAP body as a standalone document
-/// (§7.6: one SOAP 1.1 `Envelope`, one `Body`, one SAML element), or `body`
-/// itself when it already is a bare SAML document.
-fn extract_artifact_response_xml(body: &str) -> Result<String, NlEidError> {
-    let doc = crate::xml::parse_secure(body).map_err(|e| {
-        NlEidError::MalformedMessage(format!("back-channel body is not well-formed XML: {e}"))
-    })?;
-    let root = doc
-        .document_element()
-        .ok_or_else(|| NlEidError::MalformedMessage("empty document".to_string()))?;
-    if !xmlutil::is_element(&doc, root, constants::NS_SOAP11, "Envelope") {
-        return Ok(body.to_string());
-    }
-    let bodies = xmlutil::element_children(&doc, root, constants::NS_SOAP11, "Body");
-    let [soap_body] = bodies[..] else {
-        return Err(NlEidError::MalformedMessage(format!(
-            "SOAP envelope carries {} Body elements",
-            bodies.len()
-        )));
-    };
-    let children: Vec<NodeId> = doc
-        .children_iter(soap_body)
-        .filter(|c| doc.element(*c).is_some())
-        .collect();
-    let [saml] = children[..] else {
-        return Err(NlEidError::MalformedMessage(format!(
-            "SOAP Body carries {} element children (exactly one SAML element expected)",
-            children.len()
-        )));
-    };
-    if xmlutil::is_element(&doc, saml, constants::NS_SOAP11, "Fault") {
-        let detail = doc.text_content_deep(saml);
-        return Err(NlEidError::MalformedMessage(format!(
-            "SOAP Fault: {}",
-            detail.split_whitespace().collect::<Vec<_>>().join(" ")
-        )));
-    }
-    Ok(xmlutil::self_contained_xml(&doc, saml))
 }
 
 fn check_issuer(
@@ -528,8 +446,8 @@ fn check_in_response_to(
     Ok(())
 }
 
-/// §7.6.1.
-fn check_artifact_response(
+/// §7.6.1 on the typed `ArtifactResponse`.
+pub fn check_artifact_response(
     cfg: &NlEidConfig,
     art: &ArtifactResponse,
     params: &ArtifactResponseParams<'_>,
@@ -562,8 +480,8 @@ fn check_artifact_response(
     Ok(())
 }
 
-/// §7.6.2 (everything except the status, which decides the outcome).
-fn check_response(
+/// §7.6.2, everything except the status.
+fn check_response_envelope(
     cfg: &NlEidConfig,
     response: &Response,
     params: &ArtifactResponseParams<'_>,
@@ -602,18 +520,16 @@ fn check_response(
     Ok(())
 }
 
-/// The shared Web Browser SSO checklist, with the signature facts established
-/// above threaded in.
+/// The shared Web Browser SSO checklist with the signature facts threaded in.
 fn run_shared_validator(
     cfg: &NlEidConfig,
     response: &Response,
     params: &ArtifactResponseParams<'_>,
     response_signature_verified: Option<bool>,
-    signed_ids: &[String],
+    verified_signed_ids: &[&str],
 ) -> Result<(), NlEidError> {
     let security = cfg.security_config();
     let validator = AssertionValidator::new(&security).with_replay_cache(params.replay_cache);
-    let ids: Vec<&str> = signed_ids.iter().map(String::as_str).collect();
     let validation = validator.validate_response(
         response,
         &ValidationParams {
@@ -626,7 +542,7 @@ fn run_shared_validator(
             relay_state: params.relay_state,
             response_signature_xml: None,
             response_signature_verified,
-            verified_signed_ids: &ids,
+            verified_signed_ids,
             current_proxy_depth: 0,
             now: params.now,
         },
@@ -650,8 +566,8 @@ fn run_shared_validator(
     )))
 }
 
-/// The eID-specific assertion rules (§7.6.3) on the typed assertion. Returns
-/// the TransientID and the delivered Level of Assurance.
+/// The eID-specific assertion rules (§7.6.3). Returns the TransientID and the
+/// delivered Level of Assurance.
 fn check_assertion(
     cfg: &NlEidConfig,
     assertion: &Assertion,
@@ -729,6 +645,146 @@ fn check_assertion(
     Ok((transient_name_id, level))
 }
 
+// ── Entry point ─────────────────────────────────────────────────────────────
+
+/// Verify and process the back-channel answer to an `ArtifactResolve` (§7.6).
+///
+/// `body` is the raw SOAP 1.1 response body (a `<soap:Envelope>` carrying
+/// exactly one `<samlp:ArtifactResponse>`), or a bare `<samlp:ArtifactResponse>`
+/// document. `verifier` MUST hold only the RD signing keys from its verified
+/// metadata, each named by its `<ds:KeyName>` (see
+/// [`super::metadata::RdMetadata::keys_manager`]); `keys` are the DV's
+/// decryption keys.
+///
+/// Steps, failing closed at the first violation:
+///
+/// 1. §9.1 / §9.3 algorithm allow-lists over the whole document.
+/// 2. Every `<ds:Signature>` in the document is verified by `verifier`
+///    (trusted keys only, strict reference positions, E91). The signature
+///    enveloping the `ArtifactResponse` MUST be its single direct
+///    `<ds:Signature>` child, name an RD key by `<ds:KeyName>` (§9.2), be
+///    valid, and reference the element's `@ID`; the same holds for the
+///    `Assertion` (and for the `Response` if it carries one). Other signatures
+///    — the AD's inside `<saml:Advice>` — are evidence (§9.1) and ignored.
+/// 3. §7.6.1 on the typed `ArtifactResponse`: `Version`, `Issuer`,
+///    `InResponseTo` = the ArtifactResolve, freshness, `Status`, exactly one
+///    `Response`.
+/// 4. [`validate_response`] on the typed `Response`.
+/// 5. §7.6.3.4: exactly one `AttributeStatement` carrying the registered
+///    `ServiceUUID`; the `ActingSubjectID` (and `LegalSubjectID`)
+///    `EncryptedID`s addressed to this DV are decrypted into
+///    §7.6.3.4.4-shaped `NameID`s.
+pub fn process_artifact_response(
+    cfg: &NlEidConfig,
+    body: &str,
+    verifier: &SamlVerifier,
+    keys: &DvDecryptionKeys,
+    params: &ArtifactResponseParams<'_>,
+) -> Result<AuthnOutcome, NlEidError> {
+    cfg.validate()?;
+
+    let art_xml = unwrap_soap_body(body)?;
+    let doc = crate::xml::parse_secure(&art_xml)?;
+    let root = doc
+        .document_element()
+        .ok_or_else(|| NlEidError::MalformedMessage("empty document".to_string()))?;
+    if !xmlutil::is_element(&doc, root, constants::NS_SAML_PROTOCOL, "ArtifactResponse") {
+        return Err(NlEidError::MalformedMessage(
+            "back-channel body is not a samlp:ArtifactResponse".to_string(),
+        ));
+    }
+
+    // 1. Algorithms, before any cryptography.
+    xmlutil::validate_algorithms(&doc, root, Some(&cfg.entity_id))?;
+
+    // 2. Signatures, bound to the consumed elements.
+    let signatures =
+        xmlutil::verify_document_signatures(&doc, &art_xml, verifier, "ArtifactResponse")?;
+    let envelope =
+        xmlutil::require_signed_element(&doc, &signatures, root, "ArtifactResponse", verifier)?;
+    let mut signed_ids = envelope.signed_ids.clone();
+
+    // 3. ArtifactResponse envelope.
+    let artifact_response = parse_saml::<ArtifactResponseRef<'_>>(&doc)?.to_owned();
+    check_artifact_response(cfg, &artifact_response, params)?;
+    let response_nodes =
+        doc.child_elements_by_name_ns(root, constants::NS_SAML_PROTOCOL, "Response");
+    let [response_node] = response_nodes[..] else {
+        return Err(NlEidError::ResponseCount(response_nodes.len()));
+    };
+    let response = ResponseRef::from_xml(&doc, response_node)?.to_owned();
+
+    let response_signature_verified = if response.base.has_signature {
+        let verified = xmlutil::require_signed_element(
+            &doc,
+            &signatures,
+            response_node,
+            "Response",
+            verifier,
+        )?;
+        signed_ids.extend(verified.signed_ids);
+        Some(true)
+    } else {
+        None
+    };
+    let assertion_nodes =
+        doc.child_elements_by_name_ns(response_node, constants::NS_SAML_ASSERTION, "Assertion");
+    if let ([assertion_node], [assertion]) = (&assertion_nodes[..], response.assertions.as_slice())
+    {
+        if assertion.has_signature {
+            let verified = xmlutil::require_signed_element(
+                &doc,
+                &signatures,
+                *assertion_node,
+                "Assertion",
+                verifier,
+            )?;
+            signed_ids.extend(verified.signed_ids);
+        }
+    }
+
+    // 4. The typed Response.
+    let ids: Vec<&str> = signed_ids.iter().map(String::as_str).collect();
+    let validated =
+        match validate_response(cfg, &response, &ids, response_signature_verified, params)? {
+            ResponseVerdict::Valid(validated) => *validated,
+            ResponseVerdict::Cancelled { status } => return Ok(AuthnOutcome::Cancelled { status }),
+            ResponseVerdict::Failed { status } => return Ok(AuthnOutcome::Failed { status }),
+        };
+
+    // 5. Identifiers (the assertion count was established by validate_response).
+    let identity = extract_identity_attributes(cfg, &doc, assertion_nodes[0], keys)?;
+
+    Ok(AuthnOutcome::Authenticated(Box::new(NlEidAuthnResult {
+        authn: validated.authn,
+        transient_name_id: validated.transient_name_id,
+        level_of_assurance: validated.level_of_assurance,
+        authenticating_authorities: validated.authenticating_authorities,
+        service_uuid: identity.service_uuid,
+        acting_subject: identity.acting_subject,
+        legal_subject: identity.legal_subject,
+        rd_signing_key_name: envelope.key_name,
+    })))
+}
+
+/// The `<samlp:ArtifactResponse>` document of a SOAP body (§7.6: one SOAP 1.1
+/// `Envelope`, one `Body`, one SAML element), or `body` itself when it already
+/// is a bare SAML document.
+fn unwrap_soap_body(body: &str) -> Result<String, NlEidError> {
+    let doc = crate::xml::parse_secure(body).map_err(|e| {
+        NlEidError::MalformedMessage(format!("back-channel body is not well-formed XML: {e}"))
+    })?;
+    let root = doc
+        .document_element()
+        .ok_or_else(|| NlEidError::MalformedMessage("empty document".to_string()))?;
+    if !xmlutil::is_element(&doc, root, constants::NS_SOAP11, "Envelope") {
+        return Ok(body.to_string());
+    }
+    crate::bindings::soap::soap_envelope_unwrap(body.as_bytes())
+        .map(|unwrapped| unwrapped.body_xml)
+        .map_err(|e| NlEidError::MalformedMessage(e.to_string()))
+}
+
 struct IdentityAttributes {
     service_uuid: String,
     acting_subject: SubjectId,
@@ -736,16 +792,15 @@ struct IdentityAttributes {
 }
 
 /// §7.6.3.4: read the `AttributeStatement` of the outer assertion from the
-/// parsed tree (so the `EncryptedID` elements can be re-serialized intact),
-/// bind the `ServiceUUID`, and decrypt the identifier attributes.
+/// document (the `EncryptedID` elements must be handed to the decryptor
+/// intact), bind the `ServiceUUID`, and decrypt the identifier attributes.
 fn extract_identity_attributes(
     cfg: &NlEidConfig,
     doc: &Document<'_>,
     assertion_node: NodeId,
     keys: &DvDecryptionKeys,
 ) -> Result<IdentityAttributes, NlEidError> {
-    let statements = xmlutil::element_children(
-        doc,
+    let statements = doc.child_elements_by_name_ns(
         assertion_node,
         constants::NS_SAML_ASSERTION,
         "AttributeStatement",
@@ -754,8 +809,8 @@ fn extract_identity_attributes(
         return Err(NlEidError::AttributeStatementCount(statements.len()));
     };
     let attributes =
-        xmlutil::element_children(doc, statement, constants::NS_SAML_ASSERTION, "Attribute");
-    let find = |name: &str| -> Vec<NodeId> {
+        doc.child_elements_by_name_ns(statement, constants::NS_SAML_ASSERTION, "Attribute");
+    let named = |name: &str| -> Vec<NodeId> {
         attributes
             .iter()
             .copied()
@@ -763,12 +818,12 @@ fn extract_identity_attributes(
             .collect()
     };
 
-    let service_uuid = find(constants::ATTR_SERVICE_UUID)
+    let service_uuid = named(constants::ATTR_SERVICE_UUID)
         .first()
         .and_then(|a| {
-            xmlutil::element_child(doc, *a, constants::NS_SAML_ASSERTION, "AttributeValue")
+            doc.first_child_element_by_name_ns(*a, constants::NS_SAML_ASSERTION, "AttributeValue")
         })
-        .and_then(|v| xmlutil::text_only(doc, v))
+        .and_then(|v| xmlutil::element_text(doc, v))
         .filter(|s| !s.is_empty());
     match service_uuid.as_deref() {
         Some(u) if u == cfg.service_uuid => {}
@@ -780,14 +835,12 @@ fn extract_identity_attributes(
         }
     }
 
-    let acting_nodes = find(constants::ATTR_ACTING_SUBJECT_ID);
-    let acting_subject = match acting_nodes[..] {
+    let acting_subject = match named(constants::ATTR_ACTING_SUBJECT_ID)[..] {
         [] => return Err(NlEidError::MissingActingSubjectId),
         [node] => decrypt_subject_attribute(cfg, doc, node, "ActingSubjectID", keys)?,
         _ => return Err(NlEidError::TooManySubjectIds("ActingSubjectID")),
     };
-    let legal_nodes = find(constants::ATTR_LEGAL_SUBJECT_ID);
-    let legal_subject = match legal_nodes[..] {
+    let legal_subject = match named(constants::ATTR_LEGAL_SUBJECT_ID)[..] {
         [] => None,
         [node] => Some(decrypt_subject_attribute(
             cfg,
@@ -806,14 +859,6 @@ fn extract_identity_attributes(
     })
 }
 
-/// All `<xenc:EncryptedKey>` elements below `node`.
-fn encrypted_keys(doc: &Document<'_>, node: NodeId) -> Vec<NodeId> {
-    xmlutil::descendant_elements(doc, node)
-        .into_iter()
-        .filter(|n| xmlutil::is_element(doc, *n, constants::NS_XENC, "EncryptedKey"))
-        .collect()
-}
-
 /// Decrypt the one `<saml:EncryptedID>` of `attribute_node` that is addressed
 /// to this DV (§7.6.3.4 `@Recipient`) into a §7.6.3.4.4 `NameID`.
 fn decrypt_subject_attribute(
@@ -823,15 +868,17 @@ fn decrypt_subject_attribute(
     attribute: &'static str,
     keys: &DvDecryptionKeys,
 ) -> Result<SubjectId, NlEidError> {
-    let encrypted_ids: Vec<NodeId> = xmlutil::element_children(
-        doc,
-        attribute_node,
-        constants::NS_SAML_ASSERTION,
-        "AttributeValue",
-    )
-    .into_iter()
-    .filter_map(|v| xmlutil::element_child(doc, v, constants::NS_SAML_ASSERTION, "EncryptedID"))
-    .collect();
+    let encrypted_ids: Vec<NodeId> = doc
+        .child_elements_by_name_ns(
+            attribute_node,
+            constants::NS_SAML_ASSERTION,
+            "AttributeValue",
+        )
+        .into_iter()
+        .filter_map(|v| {
+            doc.first_child_element_by_name_ns(v, constants::NS_SAML_ASSERTION, "EncryptedID")
+        })
+        .collect();
     if encrypted_ids.is_empty() {
         return Err(NlEidError::MalformedMessage(format!(
             "{attribute} carries no EncryptedID"
@@ -843,7 +890,7 @@ fn decrypt_subject_attribute(
     let mut ours: Vec<NodeId> = Vec::new();
     for enc_id in &encrypted_ids {
         let mut addressed_to_us = false;
-        for key in encrypted_keys(doc, *enc_id) {
+        for key in xmlutil::descendant_elements(doc, *enc_id, constants::NS_XENC, "EncryptedKey") {
             let recipient = doc.get_attribute(key, "Recipient");
             recipients.push(recipient.unwrap_or("<absent>").to_string());
             if recipient == Some(cfg.entity_id.as_str()) {
@@ -881,49 +928,26 @@ fn pruned_encrypted_id_xml(
     enc_id: NodeId,
     recipient: &str,
 ) -> Result<String, NlEidError> {
-    let xml = xmlutil::self_contained_xml(doc, enc_id);
-    let standalone = crate::xml::parse_secure(&xml)?;
-    let root = standalone
-        .document_element()
-        .ok_or_else(|| NlEidError::MalformedMessage("EncryptedID is empty".to_string()))?;
-
+    let mut standalone = xmlutil::standalone_document(doc, enc_id)?;
     let mut removed_ids: Vec<String> = Vec::new();
-    let mut cuts: Vec<std::ops::Range<usize>> = Vec::new();
-    for key in encrypted_keys(&standalone, root) {
+    for key in standalone.get_elements_by_tag_name_ns(constants::NS_XENC, "EncryptedKey") {
         if standalone.get_attribute(key, "Recipient") == Some(recipient) {
             continue;
         }
         if let Some(id) = standalone.get_attribute(key, "Id") {
             removed_ids.push(id.to_string());
         }
-        if let Some(range) = standalone.node_range(key) {
-            cuts.push(range);
-        }
+        standalone.detach(key);
     }
-    for rm in xmlutil::descendant_elements(&standalone, root)
-        .into_iter()
-        .filter(|n| xmlutil::is_element(&standalone, *n, constants::NS_DS, "RetrievalMethod"))
-    {
+    for retrieval in standalone.get_elements_by_tag_name_ns(constants::NS_DS, "RetrievalMethod") {
         let target = standalone
-            .get_attribute(rm, "URI")
+            .get_attribute(retrieval, "URI")
             .and_then(|u| u.strip_prefix('#'));
         if target.is_some_and(|t| removed_ids.iter().any(|r| r == t)) {
-            if let Some(range) = standalone.node_range(rm) {
-                cuts.push(range);
-            }
+            standalone.detach(retrieval);
         }
     }
-    cuts.sort_by_key(|cut| std::cmp::Reverse(cut.start));
-    let mut out = xml.clone();
-    let mut last_start = usize::MAX;
-    for cut in cuts {
-        if cut.end > last_start {
-            continue; // nested inside an already removed range
-        }
-        out.replace_range(cut.clone(), "");
-        last_start = cut.start;
-    }
-    Ok(out)
+    Ok(standalone.to_xml())
 }
 
 /// §7.6.3.4.4: the decrypted plaintext MUST be a `<saml:NameID>` with the
@@ -939,12 +963,13 @@ fn decrypted_name_id(plaintext: &str, attribute: &'static str) -> Result<Subject
     let root = doc
         .document_element()
         .ok_or_else(|| invalid("plaintext is empty"))?;
+    // The decryptor replaces `<xenc:EncryptedData>` in place, so the plaintext
+    // is either the bare `<saml:NameID>` or the `<saml:EncryptedID>` wrapper
+    // around it.
     let name_id_node = if xmlutil::is_element(&doc, root, constants::NS_SAML_ASSERTION, "NameID") {
         root
     } else {
-        xmlutil::descendant_elements(&doc, root)
-            .into_iter()
-            .find(|n| xmlutil::is_element(&doc, *n, constants::NS_SAML_ASSERTION, "NameID"))
+        doc.first_child_element_by_name_ns(root, constants::NS_SAML_ASSERTION, "NameID")
             .ok_or_else(|| invalid("plaintext does not contain a saml:NameID"))?
     };
     let name_id = NameIdRef::from_xml(&doc, name_id_node)
@@ -986,8 +1011,371 @@ fn decrypted_name_id(plaintext: &str, attribute: &'static str) -> Result<Subject
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::assertion::attribute::{Attribute, AttributeStatement, AttributeValue};
+    use crate::core::assertion::authn::{AuthnContext, AuthnStatement};
+    use crate::core::assertion::conditions::{AudienceRestriction, Conditions};
+    use crate::core::assertion::issuer::Issuer;
+    use crate::core::assertion::name_id::NameId;
+    use crate::core::assertion::subject::{Subject, SubjectConfirmation, SubjectConfirmationData};
+    use crate::core::identifiers::SamlVersion;
+    use crate::core::protocol::response::ResponseBase;
+    use crate::security::replay::InMemoryReplayCache;
+    use chrono::TimeDelta;
 
     const DV: &str = "urn:nl-eid-gdi:1.0:DV:00000001234567890000:entities:9001";
+    const RD: &str = "urn:nl-eid-gdi:1.0:RD:00000004000000149000:entities:9002";
+    const ACS: &str = "https://dv.example.nl/saml/acs";
+    const AUTHN_ID: &str = "_authn1";
+    const RESOLVE_ID: &str = "_resolve1";
+    const RESP_ID: &str = "_resp1";
+    const ASSERTION_ID: &str = "_assertion1";
+
+    fn cfg() -> NlEidConfig {
+        NlEidConfig::service_provider(
+            DV,
+            "f847dc11-ac24-47b2-84a8-a057440ce56d",
+            ACS,
+            RD,
+            LevelOfAssurance::Low,
+        )
+    }
+
+    fn params<'a>(now: DateTime<Utc>, cache: &'a dyn ReplayCache) -> ArtifactResponseParams<'a> {
+        ArtifactResponseParams {
+            expected_artifact_resolve_id: RESOLVE_ID,
+            expected_authn_request_id: AUTHN_ID,
+            replay_cache: cache,
+            relay_state: None,
+            now,
+        }
+    }
+
+    /// A typed Response as the RD issues it for a successful login.
+    fn make_response(now: DateTime<Utc>, loa: &str) -> Response {
+        Response {
+            base: ResponseBase {
+                id: RESP_ID.to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: now,
+                destination: Some(ACS.to_string()),
+                consent: None,
+                issuer: Some(Issuer::entity(RD)),
+                has_signature: false,
+                in_response_to: Some(AUTHN_ID.to_string()),
+                status: Status::success(),
+            },
+            assertions: vec![Assertion {
+                id: ASSERTION_ID.to_string(),
+                version: SamlVersion::V2_0,
+                issue_instant: now,
+                issuer: Issuer::entity(RD),
+                has_signature: true,
+                subject: Some(Subject {
+                    name_id: Some(NameIdOrEncryptedId::NameId(NameId {
+                        value: "transient-1".to_string(),
+                        format: None,
+                        name_qualifier: None,
+                        sp_name_qualifier: None,
+                        sp_provided_id: None,
+                    })),
+                    subject_confirmations: vec![SubjectConfirmation {
+                        method: constants::CM_BEARER.to_string(),
+                        name_id: None,
+                        subject_confirmation_data: Some(SubjectConfirmationData {
+                            not_before: None,
+                            not_on_or_after: Some(now + TimeDelta::minutes(2)),
+                            recipient: Some(ACS.to_string()),
+                            in_response_to: Some(AUTHN_ID.to_string()),
+                            address: None,
+                            key_info_x509_certs: vec![],
+                        }),
+                    }],
+                }),
+                conditions: Some(Conditions {
+                    not_before: Some(now - TimeDelta::minutes(2)),
+                    not_on_or_after: Some(now + TimeDelta::minutes(2)),
+                    audience_restrictions: vec![AudienceRestriction {
+                        audiences: vec![DV.to_string()],
+                    }],
+                    one_time_use: false,
+                    proxy_restriction: None,
+                }),
+                advice: None,
+                authn_statements: vec![AuthnStatement {
+                    authn_instant: now,
+                    session_index: None,
+                    session_not_on_or_after: None,
+                    subject_locality: None,
+                    authn_context: AuthnContext {
+                        authn_context_class_ref: Some(loa.to_string()),
+                        authn_context_decl_ref: None,
+                        authenticating_authorities: vec![
+                            "urn:nl-eid-gdi:1.0:AD:1:entities:0001".to_string()
+                        ],
+                    },
+                }],
+                authz_decision_statements: vec![],
+                attribute_statements: vec![AttributeStatement {
+                    attributes: vec![Attribute {
+                        name: constants::ATTR_SERVICE_UUID.to_string(),
+                        name_format: None,
+                        friendly_name: None,
+                        values: vec![AttributeValue::String(
+                            "f847dc11-ac24-47b2-84a8-a057440ce56d".to_string(),
+                        )],
+                    }],
+                }],
+            }],
+            encrypted_assertions: vec![],
+        }
+    }
+
+    fn validate(cfg: &NlEidConfig, response: &Response) -> Result<ResponseVerdict, NlEidError> {
+        let cache = InMemoryReplayCache::new();
+        validate_response(
+            cfg,
+            response,
+            &[RESP_ID, ASSERTION_ID],
+            None,
+            &params(Utc::now(), &cache),
+        )
+    }
+
+    #[test]
+    fn test_validate_response_happy_path() {
+        let resp = make_response(Utc::now(), constants::LOA_SUBSTANTIAL_EIDAS);
+        match validate(&cfg(), &resp).unwrap() {
+            ResponseVerdict::Valid(v) => {
+                assert_eq!(v.transient_name_id, "transient-1");
+                assert_eq!(v.level_of_assurance, LevelOfAssurance::Substantial);
+                assert_eq!(v.authenticating_authorities.len(), 1);
+                assert_eq!(v.authn.assertion_id, ASSERTION_ID);
+                assert_eq!(v.authn.idp_entity_id, RD);
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_response_statuses() {
+        let mut resp = make_response(Utc::now(), constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.assertions.clear();
+        resp.base.status = Status::with_sub_status(
+            constants::STATUS_RESPONDER,
+            constants::STATUS_AUTHN_FAILED,
+            Some(constants::STATUS_MESSAGE_CANCELLED.to_string()),
+        );
+        assert!(matches!(
+            validate(&cfg(), &resp).unwrap(),
+            ResponseVerdict::Cancelled { .. }
+        ));
+        resp.base.status = Status::with_sub_status(
+            constants::STATUS_RESPONDER,
+            constants::STATUS_REQUEST_UNSUPPORTED,
+            None,
+        );
+        assert!(matches!(
+            validate(&cfg(), &resp).unwrap(),
+            ResponseVerdict::Failed { .. }
+        ));
+        // An assertion on a failure status is a protocol violation.
+        let mut with_assertion = make_response(Utc::now(), constants::LOA_SUBSTANTIAL_EIDAS);
+        with_assertion.base.status = Status::responder(None);
+        assert!(matches!(
+            validate(&cfg(), &with_assertion),
+            Err(NlEidError::AssertionCount { success: false, .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_response_envelope_bindings() {
+        let now = Utc::now();
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.base.issuer = Some(Issuer::entity("urn:someone-else"));
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::IssuerMismatch {
+                element: "Response",
+                ..
+            })
+        ));
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.base.destination = Some("https://attacker.example/acs".to_string());
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::DestinationMismatch { .. })
+        ));
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.base.in_response_to = Some("_theirs".to_string());
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::InResponseToMismatch {
+                element: "Response",
+                ..
+            })
+        ));
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.encrypted_assertions
+            .push(crate::core::assertion::types::EncryptedAssertion {
+                raw: b"<x/>".to_vec(),
+            });
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::EncryptedAssertionForbidden)
+        ));
+        let mut resp = make_response(
+            now - TimeDelta::minutes(20),
+            constants::LOA_SUBSTANTIAL_EIDAS,
+        );
+        resp.base.issue_instant = now - TimeDelta::minutes(20);
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::StaleMessage { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_response_assertion_rules() {
+        let now = Utc::now();
+        // Two assertions.
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        let extra = resp.assertions[0].clone();
+        resp.assertions.push(extra);
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::AssertionCount {
+                success: true,
+                found: 2
+            })
+        ));
+        // Unsigned assertion: refused by default, accepted when configured.
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.assertions[0].has_signature = false;
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::MissingSignature("Assertion"))
+        ));
+        let mut lenient = cfg();
+        lenient.require_assertion_signature = false;
+        assert!(matches!(
+            validate(&lenient, &resp).unwrap(),
+            ResponseVerdict::Valid(_)
+        ));
+        // Signature markup without a verified reference to the assertion.
+        let resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        let cache = InMemoryReplayCache::new();
+        let err =
+            validate_response(&cfg(), &resp, &[RESP_ID], None, &params(now, &cache)).unwrap_err();
+        assert!(err.to_string().contains("signature"), "{err}");
+        // LoA below the minimum / unknown.
+        assert!(matches!(
+            validate(&cfg(), &make_response(now, constants::LOA_BASIC)),
+            Err(NlEidError::LevelOfAssuranceTooLow { .. })
+        ));
+        assert!(matches!(
+            validate(&cfg(), &make_response(now, "urn:bogus")),
+            Err(NlEidError::UnknownLevelOfAssurance(_))
+        ));
+        // Subject NameID with a non-transient Format.
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        if let Some(NameIdOrEncryptedId::NameId(n)) = resp.assertions[0]
+            .subject
+            .as_mut()
+            .unwrap()
+            .name_id
+            .as_mut()
+        {
+            n.format = Some(constants::NAMEID_PERSISTENT.to_string());
+        }
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::InvalidSubjectNameId(_))
+        ));
+        // Conditions without NotBefore.
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.assertions[0].conditions.as_mut().unwrap().not_before = None;
+        assert!(matches!(
+            validate(&cfg(), &resp),
+            Err(NlEidError::MissingRequired("Conditions/@NotBefore"))
+        ));
+        // Foreign audience: caught by the shared validator.
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.assertions[0]
+            .conditions
+            .as_mut()
+            .unwrap()
+            .audience_restrictions = vec![AudienceRestriction {
+            audiences: vec!["urn:other-dv".to_string()],
+        }];
+        let err = validate(&cfg(), &resp).unwrap_err();
+        assert!(matches!(err, NlEidError::Profile(_)), "{err}");
+        // Spliced assertion: bearer InResponseTo for another request.
+        let mut resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        resp.assertions[0]
+            .subject
+            .as_mut()
+            .unwrap()
+            .subject_confirmations[0]
+            .subject_confirmation_data
+            .as_mut()
+            .unwrap()
+            .in_response_to = Some("_theirs".to_string());
+        let err = validate(&cfg(), &resp).unwrap_err();
+        assert!(err.to_string().contains("InResponseTo"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_response_replay() {
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let resp = make_response(now, constants::LOA_SUBSTANTIAL_EIDAS);
+        let p = params(now, &cache);
+        assert!(validate_response(&cfg(), &resp, &[RESP_ID, ASSERTION_ID], None, &p).is_ok());
+        let err = validate_response(&cfg(), &resp, &[RESP_ID, ASSERTION_ID], None, &p).unwrap_err();
+        assert!(err.to_string().contains("replayed"), "{err}");
+    }
+
+    #[test]
+    fn test_check_artifact_response() {
+        let now = Utc::now();
+        let cache = InMemoryReplayCache::new();
+        let p = params(now, &cache);
+        let art = |irt: &str, status: Status| ArtifactResponse {
+            id: "_art1".to_string(),
+            version: SamlVersion::V2_0,
+            issue_instant: now,
+            destination: None,
+            consent: None,
+            issuer: Some(Issuer::entity(RD)),
+            has_signature: true,
+            in_response_to: Some(irt.to_string()),
+            status,
+            message: None,
+        };
+        assert!(check_artifact_response(&cfg(), &art(RESOLVE_ID, Status::success()), &p).is_ok());
+        assert!(matches!(
+            check_artifact_response(&cfg(), &art("_other", Status::success()), &p),
+            Err(NlEidError::InResponseToMismatch {
+                element: "ArtifactResponse",
+                ..
+            })
+        ));
+        assert!(matches!(
+            check_artifact_response(
+                &cfg(),
+                &art(
+                    RESOLVE_ID,
+                    Status::with_sub_status(
+                        constants::STATUS_REQUESTER,
+                        constants::STATUS_REQUEST_DENIED,
+                        None
+                    )
+                ),
+                &p
+            ),
+            Err(NlEidError::ArtifactResolutionFailed(_))
+        ));
+    }
 
     #[test]
     fn test_subject_id_debug_is_redacted() {
@@ -1047,7 +1435,6 @@ mod tests {
         assert_eq!(id.expose_value(), "900070341");
         assert_eq!(id.identifier_type(), IdentifierType::LegacyBsn);
 
-        // Wrapped in an EncryptedID (the backend replaces EncryptedData in place).
         let wrapped = format!(
             r#"<saml:EncryptedID xmlns:saml="{}">{ok}</saml:EncryptedID>"#,
             constants::NS_SAML_ASSERTION
@@ -1098,22 +1485,23 @@ mod tests {
         assert!(!pruned.contains("urn:other"), "{pruned}");
         assert!(pruned.contains("k-ours"), "{pruned}");
         assert!(pruned.contains("CC=="), "{pruned}");
-        // Still well-formed with exactly one EncryptedKey.
         let p = crate::xml::parse_secure(&pruned).unwrap();
-        let r = p.document_element().unwrap();
-        assert_eq!(encrypted_keys(&p, r).len(), 1);
+        assert_eq!(p.get_elements_by_tag_name_ns(xenc, "EncryptedKey").len(), 1);
+        assert_eq!(
+            p.get_elements_by_tag_name_ns(ds, "RetrievalMethod").len(),
+            1
+        );
     }
 
     #[test]
-    fn test_extract_artifact_response_xml_from_soap() {
+    fn test_unwrap_soap_body() {
         let samlp = constants::NS_SAML_PROTOCOL;
         let soap = constants::NS_SOAP11;
         let env = format!(
             r#"<soapenv:Envelope xmlns:soapenv="{soap}" xmlns:samlp="{samlp}"><soapenv:Body><samlp:ArtifactResponse ID="_a" Version="2.0" IssueInstant="2024-01-01T00:00:00Z"><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:ArtifactResponse></soapenv:Body></soapenv:Envelope>"#,
             constants::STATUS_SUCCESS
         );
-        let xml = extract_artifact_response_xml(&env).unwrap();
-        assert!(xml.starts_with("<samlp:ArtifactResponse"));
+        let xml = unwrap_soap_body(&env).unwrap();
         let doc = crate::xml::parse_secure(&xml).unwrap();
         assert!(xmlutil::is_element(
             &doc,
@@ -1121,21 +1509,21 @@ mod tests {
             samlp,
             "ArtifactResponse"
         ));
-
-        // Bare documents pass through; non-XML and multi-child bodies fail.
-        assert_eq!(extract_artifact_response_xml(&xml).unwrap(), xml);
-        assert!(extract_artifact_response_xml("502 Bad Gateway").is_err());
+        assert_eq!(unwrap_soap_body(&xml).unwrap(), xml);
+        assert!(unwrap_soap_body("502 Bad Gateway").is_err());
         let two = format!(
             r#"<soapenv:Envelope xmlns:soapenv="{soap}" xmlns:samlp="{samlp}"><soapenv:Body><samlp:ArtifactResponse ID="_a"/><samlp:ArtifactResponse ID="_b"/></soapenv:Body></soapenv:Envelope>"#
         );
         assert!(matches!(
-            extract_artifact_response_xml(&two),
+            unwrap_soap_body(&two),
             Err(NlEidError::MalformedMessage(_))
         ));
         let fault = format!(
             r#"<soapenv:Envelope xmlns:soapenv="{soap}"><soapenv:Body><soapenv:Fault><faultcode>soapenv:Server</faultcode><faultstring>boom</faultstring></soapenv:Fault></soapenv:Body></soapenv:Envelope>"#
         );
-        let err = extract_artifact_response_xml(&fault).unwrap_err();
-        assert!(err.to_string().contains("SOAP Fault"), "{err}");
+        assert!(matches!(
+            unwrap_soap_body(&fault),
+            Err(NlEidError::MalformedMessage(_))
+        ));
     }
 }

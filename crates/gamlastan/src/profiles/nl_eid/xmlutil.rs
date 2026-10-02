@@ -1,21 +1,22 @@
-// XML navigation, signature-binding and algorithm helpers shared by the eID
-// SAML profile modules.
+// Shared helpers for the eID SAML profile: signature binding on top of
+// `SamlVerifier`, the §9.1 / §9.3 algorithm scan, freshness bounds, and the
+// few uppsala document operations the profile needs beyond the typed model.
 //
-// Everything here operates on a single parsed `uppsala::Document`: the
-// ArtifactResponse → Response → Assertion chain is navigated on one tree, and
-// a signed sub-element is re-serialized with `Document::node_to_xml` (which
-// carries the ancestor namespace bindings) only when it has to be handed to
-// the verifier or decryptor as a standalone document.
+// SAML messages are read through the typed deserializers (`parse_saml`,
+// `SamlDeserialize::from_xml`); the document tree is only consulted where the
+// typed model cannot carry the information — which `<ds:Signature>` belongs to
+// which element, the `<ds:KeyName>` of a signature, and the `<saml:EncryptedID>`
+// elements that must be handed to the decryptor as standalone documents.
 
 use chrono::{DateTime, TimeDelta, Utc};
 
 use crate::crypto::{SamlVerifier, VerifyResult};
-use crate::xml::uppsala::{Document, NodeId, NodeKind};
+use crate::xml::uppsala::{Document, NodeId};
 
 use super::constants;
 use super::error::NlEidError;
 
-// ── Navigation ──────────────────────────────────────────────────────────────
+// ── Document access ─────────────────────────────────────────────────────────
 
 /// Whether `node` is the element `{ns}local`.
 pub(crate) fn is_element(doc: &Document<'_>, node: NodeId, ns: &str, local: &str) -> bool {
@@ -23,209 +24,90 @@ pub(crate) fn is_element(doc: &Document<'_>, node: NodeId, ns: &str, local: &str
         .is_some_and(|e| e.matches_name_ns(ns, local))
 }
 
-/// Direct element children of `node` named `{ns}local`, in document order.
-pub(crate) fn element_children(
+/// The trimmed text of an element that holds text only.
+pub(crate) fn element_text(doc: &Document<'_>, node: NodeId) -> Option<String> {
+    doc.element_text(node).map(|t| t.trim().to_string())
+}
+
+/// Descendant elements of `node` named `{ns}local`, in document order.
+pub(crate) fn descendant_elements(
     doc: &Document<'_>,
     node: NodeId,
     ns: &str,
     local: &str,
 ) -> Vec<NodeId> {
-    doc.children_iter(node)
-        .filter(|c| is_element(doc, *c, ns, local))
-        .collect()
-}
-
-/// The first direct element child of `node` named `{ns}local`.
-pub(crate) fn element_child(
-    doc: &Document<'_>,
-    node: NodeId,
-    ns: &str,
-    local: &str,
-) -> Option<NodeId> {
-    doc.children_iter(node)
-        .find(|c| is_element(doc, *c, ns, local))
-}
-
-/// Every element in the subtree below `node` (excluding `node`), document order.
-pub(crate) fn descendant_elements(doc: &Document<'_>, node: NodeId) -> Vec<NodeId> {
     doc.descendants(node)
         .into_iter()
-        .filter(|n| doc.element(*n).is_some())
+        .filter(|n| is_element(doc, *n, ns, local))
         .collect()
 }
 
-/// The text content of an element that must hold *only* text: `None` when the
-/// element has element children. Text and CDATA runs are concatenated (so a
-/// comment splitting a value cannot truncate it) and trimmed.
-pub(crate) fn text_only(doc: &Document<'_>, node: NodeId) -> Option<String> {
-    let mut out = String::new();
-    for child in doc.children_iter(node) {
-        match doc.node_kind(child) {
-            Some(NodeKind::Text(t)) | Some(NodeKind::CData(t)) => out.push_str(t),
-            Some(NodeKind::Element(_)) => return None,
-            _ => {}
-        }
-    }
-    Some(out.trim().to_string())
+/// A deep copy of the subtree at `node` as its own document, so it can be
+/// serialized namespace-complete or edited without touching the received
+/// message (see [`crate::xml::helpers::node_to_self_contained_xml`]).
+pub(crate) fn standalone_document(
+    doc: &Document<'_>,
+    node: NodeId,
+) -> Result<Document<'static>, NlEidError> {
+    let mut standalone: Document<'static> = Document::new();
+    let copied = standalone
+        .import_subtree(doc, node)
+        .ok_or_else(|| NlEidError::MalformedMessage("cannot copy XML subtree".to_string()))?;
+    let root = standalone.root();
+    standalone.append_child(root, copied);
+    Ok(standalone)
 }
 
-/// The value of the attribute that names an element for a `#id` reference.
-pub(crate) fn element_id<'a>(doc: &'a Document<'a>, node: NodeId) -> Option<&'a str> {
-    doc.get_attribute(node, "ID")
-}
-
-/// Serialize the subtree rooted at `node` as a standalone document.
-///
-/// `Document::node_to_xml` emits only the namespace declarations the element
-/// itself carries; prefixes bound on an ancestor (the usual shape of an RD
-/// message, where `saml`/`samlp` are declared on the `ArtifactResponse` or even
-/// the SOAP envelope) would be left dangling. Every inherited binding that the
-/// element does not redeclare is therefore added to its start tag. Exclusive
-/// canonicalization ignores namespace declarations that are not visibly
-/// utilized, so the extra declarations cannot change a signature digest.
-pub(crate) fn self_contained_xml(doc: &Document<'_>, node: NodeId) -> String {
-    let fragment = doc.node_to_xml(node);
-    let Some(elem) = doc.element(node) else {
-        return fragment;
-    };
-    let mut seen: Vec<&str> = elem
-        .namespace_declarations
-        .iter()
-        .map(|(p, _)| p.as_ref())
-        .collect();
-    let mut inherited: Vec<(&str, &str)> = Vec::new();
-    let mut cur = doc.parent(node);
-    while let Some(p) = cur {
-        if let Some(e) = doc.element(p) {
-            for (prefix, uri) in &e.namespace_declarations {
-                let prefix: &str = prefix.as_ref();
-                if prefix == "xml" || prefix == "xmlns" || seen.contains(&prefix) {
-                    continue;
-                }
-                seen.push(prefix);
-                inherited.push((prefix, uri.as_ref()));
-            }
-        }
-        cur = doc.parent(p);
+/// Insert `template` (a serialized `<ds:Signature>` template) as the first
+/// child of the document element of `xml`, through the document tree. Used
+/// for metadata, where the signature precedes every other child of
+/// `<md:EntityDescriptor>`.
+pub(crate) fn insert_signature_as_first_child(
+    xml: &str,
+    template: &str,
+) -> Result<String, NlEidError> {
+    let mut doc = crate::xml::parse_secure_metadata(xml)?;
+    let root = doc
+        .document_element()
+        .ok_or_else(|| NlEidError::MalformedMessage("document has no root element".to_string()))?;
+    let template_doc = crate::xml::parse_secure_metadata(template)?;
+    let template_root = template_doc.document_element().ok_or_else(|| {
+        NlEidError::MalformedMessage("signature template has no root element".to_string())
+    })?;
+    let signature = doc
+        .import_subtree(&template_doc, template_root)
+        .ok_or_else(|| {
+            NlEidError::MalformedMessage("cannot copy signature template".to_string())
+        })?;
+    match doc.children_iter(root).find(|c| doc.element(*c).is_some()) {
+        Some(first) => doc.insert_before(root, signature, first),
+        None => doc.append_child(root, signature),
     }
-    if inherited.is_empty() || !fragment.starts_with('<') {
-        return fragment;
-    }
-    let name_end = fragment[1..]
-        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-        .map(|i| i + 1)
-        .unwrap_or(fragment.len());
-    let mut decls = String::new();
-    for (prefix, uri) in inherited {
-        use bergshamra_c14n::escape::escape_attr;
-        if prefix.is_empty() {
-            decls.push_str(&format!(" xmlns=\"{}\"", escape_attr(uri)));
-        } else {
-            decls.push_str(&format!(" xmlns:{prefix}=\"{}\"", escape_attr(uri)));
-        }
-    }
-    format!(
-        "{}{}{}",
-        &fragment[..name_end],
-        decls,
-        &fragment[name_end..]
-    )
+    Ok(doc.to_xml())
 }
 
 // ── Signatures ──────────────────────────────────────────────────────────────
 
-/// Locate the single *enveloping* `<ds:Signature>` of `element_node`: it MUST
-/// be a direct child, there MUST be exactly one such child, and it MUST be the
-/// first `<ds:Signature>` in the element's subtree in document order.
-///
-/// The verifier processes the first signature it encounters, so a nested
-/// signature placed earlier (a genuine RD signature wrapped inside a forged
-/// outer element) would be the one verified while the structural checks look
-/// at the enveloping one. Genuine eID messages always place the enveloping
-/// signature first (`Issuer` → `Signature` → …), so this only rejects wrapped
-/// documents.
-pub(crate) fn enveloping_signature(
+/// Every `<ds:Signature>` of a received document, with the verifier's verdict
+/// for each. `SamlVerifier::verify_all_enveloped` reports the signatures in
+/// document order; so does the element enumeration, which is what aligns the
+/// two. Signatures the profile does not consume (the AD's signature inside
+/// `<saml:Advice>`, §9.1) are allowed to be invalid against the RD keys.
+pub(crate) struct DocumentSignatures {
+    nodes: Vec<NodeId>,
+    results: Vec<VerifyResult>,
+}
+
+/// Verify every signature in `xml` (the exact bytes `doc` was parsed from).
+pub(crate) fn verify_document_signatures(
     doc: &Document<'_>,
-    element_node: NodeId,
-    element: &'static str,
-) -> Result<NodeId, NlEidError> {
-    let direct = element_children(doc, element_node, constants::NS_DS, "Signature");
-    let [sig] = direct[..] else {
-        return Err(if direct.is_empty() {
-            NlEidError::MissingSignature(element)
-        } else {
-            NlEidError::AmbiguousSignature(element)
-        });
-    };
-    let first_in_subtree = descendant_elements(doc, element_node)
-        .into_iter()
-        .find(|n| is_element(doc, *n, constants::NS_DS, "Signature"));
-    if first_in_subtree != Some(sig) {
-        return Err(NlEidError::AmbiguousSignature(element));
-    }
-    Ok(sig)
-}
-
-/// The `<ds:KeyInfo>/<ds:KeyName>` of a signature, if present.
-pub(crate) fn signature_key_name(doc: &Document<'_>, sig: NodeId) -> Option<String> {
-    let key_info = element_child(doc, sig, constants::NS_DS, "KeyInfo")?;
-    let key_name = element_child(doc, key_info, constants::NS_DS, "KeyName")?;
-    text_only(doc, key_name).filter(|s| !s.is_empty())
-}
-
-/// §9.2: an RD signature MUST carry a `<ds:KeyName>` that corresponds to a
-/// `<ds:KeyName>` in a `<md:KeyDescriptor>` of the RD's verified metadata. The
-/// verifier's key manager is expected to hold the RD keys under exactly those
-/// names (see [`super::metadata::RdMetadata::keys_manager`]).
-pub(crate) fn require_known_key_name(
-    doc: &Document<'_>,
-    sig: NodeId,
-    verifier: &SamlVerifier,
-) -> Result<String, NlEidError> {
-    let name = signature_key_name(doc, sig)
-        .ok_or_else(|| NlEidError::UnknownSigningKey("KeyInfo has no KeyName".to_string()))?;
-    if verifier.keys_manager().find_by_name(&name).is_none() {
-        return Err(NlEidError::UnknownSigningKey(format!(
-            "KeyName {name:?} is not a key from the RD metadata"
-        )));
-    }
-    Ok(name)
-}
-
-/// What a successfully verified enveloping signature established.
-#[derive(Debug, Clone)]
-pub(crate) struct VerifiedSignature {
-    /// The `<ds:KeyName>` the signature carried (and the key that verified it).
-    pub key_name: String,
-    /// SAML object IDs covered by the verified XML-DSig references.
-    pub signed_ids: Vec<String>,
-}
-
-/// Verify the enveloping signature of `element_node` (whose standalone XML is
-/// `element_xml`) and bind it to the element's `@ID` (ADR 0028).
-///
-/// Steps: structural check ([`enveloping_signature`]), §9.2 `KeyName` check,
-/// cryptographic verification with `verifier` (trusted keys only, strict
-/// reference positions, E91), every reference digest locally verified, and the
-/// verified references MUST include `element_node` itself (an empty URI or
-/// `#<ID>`).
-pub(crate) fn verify_enveloping_signature(
-    doc: &Document<'_>,
-    element_node: NodeId,
-    element_xml: &str,
+    xml: &str,
     verifier: &SamlVerifier,
     element: &'static str,
-) -> Result<VerifiedSignature, NlEidError> {
-    let sig = enveloping_signature(doc, element_node, element)?;
-    let key_name = require_known_key_name(doc, sig, verifier)?;
-    let id = element_id(doc, element_node).ok_or_else(|| {
-        NlEidError::MalformedMessage(format!(
-            "{element} has no ID attribute to bind the signature to"
-        ))
-    })?;
-
-    let result = match verifier.verify_enveloped(element_xml) {
-        Ok(r) => r,
+) -> Result<DocumentSignatures, NlEidError> {
+    let nodes = doc.get_elements_by_tag_name_ns(constants::NS_DS, "Signature");
+    let results = match verifier.verify_all_enveloped(xml) {
+        Ok(results) => results,
         Err(crate::crypto::CryptoError::BergshamraError(
             bergshamra_core::Error::MissingElement(e),
         )) if e == "Signature" => return Err(NlEidError::MissingSignature(element)),
@@ -236,11 +118,87 @@ pub(crate) fn verify_enveloping_signature(
             })
         }
     };
-    let signed_ids = bind_verified_references(&result, id, element)?;
+    if results.len() != nodes.len() {
+        return Err(NlEidError::MalformedMessage(format!(
+            "the verifier reported {} signatures but the document holds {}",
+            results.len(),
+            nodes.len()
+        )));
+    }
+    Ok(DocumentSignatures { nodes, results })
+}
+
+/// What a verified enveloping signature established for an element.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedSignature {
+    /// The `<ds:KeyName>` the signature carried (and the key that verified it).
+    pub key_name: String,
+    /// SAML object IDs covered by the verified XML-DSig references.
+    pub signed_ids: Vec<String>,
+}
+
+/// Require `element_node` to carry exactly one enveloping `<ds:Signature>`
+/// child that verified, names an RD key by `<ds:KeyName>` (§9.2), and
+/// references the element's own `@ID` (ADR 0028).
+pub(crate) fn require_signed_element(
+    doc: &Document<'_>,
+    signatures: &DocumentSignatures,
+    element_node: NodeId,
+    element: &'static str,
+    verifier: &SamlVerifier,
+) -> Result<VerifiedSignature, NlEidError> {
+    let direct = doc.child_elements_by_name_ns(element_node, constants::NS_DS, "Signature");
+    let [signature] = direct[..] else {
+        return Err(if direct.is_empty() {
+            NlEidError::MissingSignature(element)
+        } else {
+            NlEidError::AmbiguousSignature(element)
+        });
+    };
+    let index = signatures
+        .nodes
+        .iter()
+        .position(|n| *n == signature)
+        .ok_or_else(|| {
+            NlEidError::MalformedMessage(format!("{element} signature was not verified"))
+        })?;
+    let key_name = require_known_key_name(doc, signature, verifier)?;
+    let id = doc.get_attribute(element_node, "ID").ok_or_else(|| {
+        NlEidError::MalformedMessage(format!(
+            "{element} has no ID attribute to bind the signature to"
+        ))
+    })?;
+    let signed_ids = bind_verified_references(&signatures.results[index], id, element)?;
     Ok(VerifiedSignature {
         key_name,
         signed_ids,
     })
+}
+
+/// The `<ds:KeyInfo>/<ds:KeyName>` of a signature, if present.
+pub(crate) fn signature_key_name(doc: &Document<'_>, signature: NodeId) -> Option<String> {
+    let key_info = doc.first_child_element_by_name_ns(signature, constants::NS_DS, "KeyInfo")?;
+    let key_name = doc.first_child_element_by_name_ns(key_info, constants::NS_DS, "KeyName")?;
+    element_text(doc, key_name).filter(|s| !s.is_empty())
+}
+
+/// §9.2: an RD signature MUST carry a `<ds:KeyName>` that corresponds to a
+/// `<ds:KeyName>` in a `<md:KeyDescriptor>` of the RD's verified metadata. The
+/// verifier's key manager holds the RD keys under exactly those names (see
+/// [`super::metadata::RdMetadata::keys_manager`]).
+pub(crate) fn require_known_key_name(
+    doc: &Document<'_>,
+    signature: NodeId,
+    verifier: &SamlVerifier,
+) -> Result<String, NlEidError> {
+    let name = signature_key_name(doc, signature)
+        .ok_or_else(|| NlEidError::UnknownSigningKey("KeyInfo has no KeyName".to_string()))?;
+    if verifier.keys_manager().find_by_name(&name).is_none() {
+        return Err(NlEidError::UnknownSigningKey(format!(
+            "KeyName {name:?} is not a key from the RD metadata"
+        )));
+    }
+    Ok(name)
 }
 
 /// Convert a verification result into the SAML object IDs it covers and fail
@@ -289,7 +247,7 @@ fn seconds(s: u64) -> TimeDelta {
     TimeDelta::try_seconds(i64::try_from(s).unwrap_or(i64::MAX)).unwrap_or(TimeDelta::MAX)
 }
 
-/// Bound an `@IssueInstant` / `@AuthnInstant` on both sides: it may be at most
+/// Bound an `@IssueInstant` / `@AuthnInstant` on both sides: at most
 /// `max_age_seconds` (plus skew) in the past and at most `skew_seconds` in the
 /// future.
 pub(crate) fn check_freshness(
@@ -299,20 +257,16 @@ pub(crate) fn check_freshness(
     max_age_seconds: u64,
     element: &'static str,
 ) -> Result<(), NlEidError> {
+    let out_of_range = || NlEidError::StaleMessage {
+        element,
+        detail: format!("instant {instant} is outside the usable range"),
+    };
     let skew = seconds(skew_seconds);
     let stale_after = instant
         .checked_add_signed(seconds(max_age_seconds))
         .and_then(|t| t.checked_add_signed(skew))
-        .ok_or_else(|| NlEidError::StaleMessage {
-            element,
-            detail: format!("instant {instant} is outside the usable range"),
-        })?;
-    let not_before = instant
-        .checked_sub_signed(skew)
-        .ok_or_else(|| NlEidError::StaleMessage {
-            element,
-            detail: format!("instant {instant} is outside the usable range"),
-        })?;
+        .ok_or_else(out_of_range)?;
+    let not_before = instant.checked_sub_signed(skew).ok_or_else(out_of_range)?;
     if stale_after < now {
         return Err(NlEidError::StaleMessage {
             element,
@@ -338,14 +292,12 @@ struct AlgorithmContext {
 }
 
 /// Validate that every signature, digest, canonicalization, transform and
-/// encryption algorithm declared anywhere below (and including) `node` is one
-/// the specification permits (§9.1, §9.3).
+/// encryption algorithm declared at or below `node` is one the specification
+/// permits (§9.1, §9.3).
 ///
-/// This runs over the whole received document, including the `<saml:Advice>`
-/// evidence assertions, before any cryptographic processing: §9.1 binds every
-/// participant, and a weak algorithm anywhere in the message is a reason to
-/// reject it rather than to reason about which parts it affects. The one
-/// exception is an `<xenc:EncryptedKey>` wrapped for another recipient
+/// The scan covers the whole received document, including the `<saml:Advice>`
+/// evidence assertions, before any cryptography: §9.1 binds every participant.
+/// The one exception is an `<xenc:EncryptedKey>` wrapped for another recipient
 /// (`@Recipient` present and different from `own_recipient`): §7.6.3.4 says
 /// those SHOULD be ignored, so their key-transport algorithm is not ours to
 /// judge and the subtree is skipped.
@@ -443,9 +395,7 @@ fn validate_algorithms_recursive<'a>(
                         return Err(disallowed("transform", uri));
                     }
                 }
-                "Transforms" if ctx.in_reference => {
-                    check_transform_list(doc, node)?;
-                }
+                "Transforms" if ctx.in_reference => check_transform_list(doc, node)?,
                 _ => {}
             }
         }
@@ -458,10 +408,11 @@ fn validate_algorithms_recursive<'a>(
     Ok(())
 }
 
-/// §9.1: a Reference applies the enveloped-signature transform exactly once and
-/// at most one exclusive-c14n transform, which (yielding octets) comes last.
+/// §9.1: a Reference applies the enveloped-signature transform exactly once
+/// and at most one exclusive-c14n transform, which (yielding octets) comes last.
 fn check_transform_list(doc: &Document<'_>, transforms: NodeId) -> Result<(), NlEidError> {
-    let uris: Vec<&str> = element_children(doc, transforms, constants::NS_DS, "Transform")
+    let uris: Vec<&str> = doc
+        .child_elements_by_name_ns(transforms, constants::NS_DS, "Transform")
         .into_iter()
         .map(|t| algorithm_attr(doc, t, "Transform"))
         .collect::<Result<_, _>>()?;
@@ -487,50 +438,6 @@ fn check_transform_list(doc: &Document<'_>, transforms: NodeId) -> Result<(), Nl
     Ok(())
 }
 
-// ── Signing helpers ─────────────────────────────────────────────────────────
-
-/// Insert `template` into `xml` as the first child of its document element.
-/// Used for metadata, where `<ds:Signature>` precedes every other child of
-/// `<md:EntityDescriptor>`.
-pub(crate) fn insert_signature_as_first_child(
-    xml: &str,
-    template: &str,
-) -> Result<String, NlEidError> {
-    let doc = crate::xml::parse_secure_metadata(xml)?;
-    let root = doc
-        .document_element()
-        .ok_or_else(|| NlEidError::MalformedMessage("document has no root element".to_string()))?;
-    let range = doc
-        .node_range(root)
-        .ok_or_else(|| NlEidError::MalformedMessage("root has no source range".to_string()))?;
-    // The start tag ends at the first '>' of the root element's source that is
-    // not inside an attribute value; the parser already guaranteed the start
-    // tag is well-formed, so locate it by scanning quotes.
-    let src = &xml[range.clone()];
-    let mut in_quote: Option<u8> = None;
-    let mut end_of_start_tag = None;
-    for (i, b) in src.bytes().enumerate() {
-        match (in_quote, b) {
-            (None, b'"') | (None, b'\'') => in_quote = Some(b),
-            (Some(q), c) if c == q => in_quote = None,
-            (None, b'>') => {
-                end_of_start_tag = Some(range.start + i + 1);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let at = end_of_start_tag.ok_or_else(|| {
-        NlEidError::MalformedMessage("cannot locate the end of the root start tag".to_string())
-    })?;
-    if src.ends_with("/>") && at == range.end {
-        return Err(NlEidError::MalformedMessage(
-            "cannot place a signature inside an empty root element".to_string(),
-        ));
-    }
-    Ok(format!("{}{}{}", &xml[..at], template, &xml[at..]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,24 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_text_only_concatenates_and_rejects_elements() {
-        // (A comment splitting element text is rejected by the parser itself,
-        // so the concatenation path only ever joins text with CDATA.)
-        let doc = crate::xml::parse_secure_metadata(
-            r#"<a xmlns="urn:x"><b> one two </b><d><e/></d><f/></a>"#,
-        )
-        .unwrap();
-        let root = doc.document_element().unwrap();
-        let b = element_child(&doc, root, "urn:x", "b").unwrap();
-        let d = element_child(&doc, root, "urn:x", "d").unwrap();
-        let f = element_child(&doc, root, "urn:x", "f").unwrap();
-        assert_eq!(text_only(&doc, b).as_deref(), Some("one two"));
-        assert!(text_only(&doc, d).is_none());
-        assert_eq!(text_only(&doc, f).as_deref(), Some(""));
-    }
-
-    #[test]
-    fn test_self_contained_xml_adds_inherited_declarations() {
+    fn test_standalone_document_declares_inherited_namespaces() {
         let xml = format!(
             r#"<soap:Envelope xmlns:soap="{}" xmlns:saml="{}"><soap:Body><samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a"><saml:Issuer>rd</saml:Issuer></samlp:ArtifactResponse></soap:Body></soap:Envelope>"#,
             constants::NS_SOAP11,
@@ -575,70 +465,25 @@ mod tests {
         );
         let doc = crate::xml::parse_secure(&xml).unwrap();
         let root = doc.document_element().unwrap();
-        let body = element_child(&doc, root, constants::NS_SOAP11, "Body").unwrap();
-        let art = element_child(&doc, body, SAMLP, "ArtifactResponse").unwrap();
-        let standalone = self_contained_xml(&doc, art);
+        let body = doc
+            .first_child_element_by_name_ns(root, constants::NS_SOAP11, "Body")
+            .unwrap();
+        let art = doc
+            .first_child_element_by_name_ns(body, SAMLP, "ArtifactResponse")
+            .unwrap();
+        let standalone = standalone_document(&doc, art).unwrap().to_xml();
         assert!(
             standalone.starts_with("<samlp:ArtifactResponse"),
             "{standalone}"
         );
-        // Re-parses on its own, with the Issuer still in the SAML namespace.
         let doc2 = crate::xml::parse_secure(&standalone).unwrap();
         let root2 = doc2.document_element().unwrap();
         assert!(is_element(&doc2, root2, SAMLP, "ArtifactResponse"));
         assert!(
-            element_child(&doc2, root2, constants::NS_SAML_ASSERTION, "Issuer").is_some(),
+            doc2.first_child_element_by_name_ns(root2, constants::NS_SAML_ASSERTION, "Issuer")
+                .is_some(),
             "{standalone}"
         );
-        // An element that declares everything itself is returned unchanged.
-        let plain = crate::xml::parse_secure(&standalone).unwrap();
-        let n = plain.document_element().unwrap();
-        assert_eq!(self_contained_xml(&plain, n), plain.node_to_xml(n));
-    }
-
-    #[test]
-    fn test_enveloping_signature_requires_single_first_direct_child() {
-        let good = format!(
-            r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a">{}<samlp:Status/><samlp:Response>{}</samlp:Response></samlp:ArtifactResponse>"#,
-            sig("_a"),
-            sig("_r")
-        );
-        let doc = crate::xml::parse_secure(&good).unwrap();
-        let root = doc.document_element().unwrap();
-        assert!(enveloping_signature(&doc, root, "ArtifactResponse").is_ok());
-
-        // A nested signature placed before the enveloping one is wrapping.
-        let wrapped = format!(
-            r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a"><samlp:Response>{}</samlp:Response>{}</samlp:ArtifactResponse>"#,
-            sig("_r"),
-            sig("_a")
-        );
-        let doc = crate::xml::parse_secure(&wrapped).unwrap();
-        let root = doc.document_element().unwrap();
-        assert!(matches!(
-            enveloping_signature(&doc, root, "ArtifactResponse"),
-            Err(NlEidError::AmbiguousSignature(_))
-        ));
-
-        // Two direct signatures are ambiguous; none is missing.
-        let two = format!(
-            r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a">{}{}</samlp:ArtifactResponse>"#,
-            sig("_a"),
-            sig("_a")
-        );
-        let doc = crate::xml::parse_secure(&two).unwrap();
-        let root = doc.document_element().unwrap();
-        assert!(matches!(
-            enveloping_signature(&doc, root, "ArtifactResponse"),
-            Err(NlEidError::AmbiguousSignature(_))
-        ));
-        let none = format!(r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a"/>"#);
-        let doc = crate::xml::parse_secure(&none).unwrap();
-        let root = doc.document_element().unwrap();
-        assert!(matches!(
-            enveloping_signature(&doc, root, "ArtifactResponse"),
-            Err(NlEidError::MissingSignature(_))
-        ));
     }
 
     #[test]
@@ -649,8 +494,102 @@ mod tests {
         );
         let doc = crate::xml::parse_secure(&xml).unwrap();
         let root = doc.document_element().unwrap();
-        let s = enveloping_signature(&doc, root, "ArtifactResponse").unwrap();
+        let s = doc.child_elements_by_name_ns(root, DS, "Signature")[0];
         assert_eq!(signature_key_name(&doc, s).as_deref(), Some("k1"));
+    }
+
+    #[test]
+    fn test_require_signed_element_structure() {
+        use crate::crypto::KeysManager;
+        let verifier = SamlVerifier::new(KeysManager::new());
+        let fake = |n: usize| DocumentSignatures {
+            nodes: Vec::new(),
+            results: (0..n)
+                .map(|_| VerifyResult::Invalid {
+                    reason: "unused".to_string(),
+                })
+                .collect(),
+        };
+        // No signature.
+        let xml = format!(r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a"/>"#);
+        let doc = crate::xml::parse_secure(&xml).unwrap();
+        let root = doc.document_element().unwrap();
+        assert!(matches!(
+            require_signed_element(&doc, &fake(0), root, "ArtifactResponse", &verifier),
+            Err(NlEidError::MissingSignature(_))
+        ));
+        // Two direct signatures.
+        let xml = format!(
+            r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a">{}{}</samlp:ArtifactResponse>"#,
+            sig("_a"),
+            sig("_a")
+        );
+        let doc = crate::xml::parse_secure(&xml).unwrap();
+        let root = doc.document_element().unwrap();
+        assert!(matches!(
+            require_signed_element(&doc, &fake(2), root, "ArtifactResponse", &verifier),
+            Err(NlEidError::AmbiguousSignature(_))
+        ));
+    }
+
+    #[test]
+    fn test_bind_verified_references() {
+        // A real enveloped signature over `<samlp:ArtifactResponse ID="_a">`,
+        // verified against its own certificate, so the result carries the
+        // reference `#_a`.
+        let key_pem = include_str!("../../../tests/fixtures/enc-key.pem");
+        let cert_pem = include_str!("../../../tests/fixtures/enc-cert.pem");
+        let mut key = crate::crypto::keys::loader::load_pem_auto(key_pem.as_bytes(), None).unwrap();
+        key.usage = crate::crypto::KeyUsage::Sign;
+        let mut signing = crate::crypto::KeysManager::new();
+        signing.add_key(key);
+        let template = sig("_a")
+            .replace(
+                "<ds:DigestValue>AA==</ds:DigestValue>",
+                "<ds:DigestValue></ds:DigestValue>",
+            )
+            .replace(
+                "<ds:SignatureValue>AA==</ds:SignatureValue>",
+                "<ds:SignatureValue></ds:SignatureValue>",
+            );
+        let unsigned = format!(
+            r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a">{template}</samlp:ArtifactResponse>"#
+        );
+        let signed = crate::crypto::SamlSigner::new(signing)
+            .sign_enveloped(&unsigned)
+            .unwrap();
+
+        let mut cert = crate::crypto::keys::loader::load_pem_auto(cert_pem.as_bytes(), None)
+            .unwrap()
+            .with_name("k1");
+        cert.usage = crate::crypto::KeyUsage::Verify;
+        let mut verifying = crate::crypto::KeysManager::new();
+        let cert_der = cert.x509_chain.first().cloned().unwrap();
+        verifying.add_key(cert);
+        verifying.add_trusted_cert(cert_der);
+        let result = SamlVerifier::new(verifying)
+            .verify_enveloped(&signed)
+            .unwrap();
+        assert!(result.is_valid(), "{result:?}");
+
+        assert_eq!(
+            bind_verified_references(&result, "_a", "X").unwrap(),
+            vec!["_a".to_string()]
+        );
+        assert!(matches!(
+            bind_verified_references(&result, "_other", "X"),
+            Err(NlEidError::SignatureNotBoundToElement("X"))
+        ));
+        assert!(matches!(
+            bind_verified_references(
+                &VerifyResult::Invalid {
+                    reason: "bad".to_string()
+                },
+                "_a",
+                "X"
+            ),
+            Err(NlEidError::InvalidSignature { .. })
+        ));
     }
 
     #[test]
@@ -664,38 +603,42 @@ mod tests {
 
         for (from, to, kind) in [
             (
-                constants::SIG_RSA_SHA256,
-                "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+                constants::SIG_RSA_SHA256.to_string(),
+                "http://www.w3.org/2000/09/xmldsig#rsa-sha1".to_string(),
                 "signature",
             ),
             (
-                constants::SIG_RSA_SHA256,
-                "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+                constants::SIG_RSA_SHA256.to_string(),
+                "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256".to_string(),
                 "signature",
             ),
-            (constants::DIGEST_SHA256, constants::DIGEST_SHA1, "digest"),
             (
-                &format!(
+                constants::DIGEST_SHA256.to_string(),
+                constants::DIGEST_SHA1.to_string(),
+                "digest",
+            ),
+            (
+                format!(
                     r#"CanonicalizationMethod Algorithm="{}""#,
                     constants::C14N_EXCLUSIVE
                 ),
-                r#"CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#WithComments""#,
+                r#"CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#WithComments""#.to_string(),
                 "canonicalization",
             ),
             (
-                &format!(
+                format!(
                     r#"Transform Algorithm="{}"/><ds:Transform Algorithm="{}""#,
                     constants::TRANSFORM_ENVELOPED_SIGNATURE,
                     constants::C14N_EXCLUSIVE
                 ),
-                &format!(
+                format!(
                     r#"Transform Algorithm="{}"/><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116""#,
                     constants::TRANSFORM_ENVELOPED_SIGNATURE
                 ),
                 "transform",
             ),
         ] {
-            let bad = ok.replacen(from, to, 1);
+            let bad = ok.replacen(&from, &to, 1);
             assert_ne!(bad, ok, "replacement {from} must apply");
             let doc = crate::xml::parse_secure(&bad).unwrap();
             let err = validate_algorithms(&doc, doc.document_element().unwrap(), None).unwrap_err();
@@ -714,18 +657,18 @@ mod tests {
                 r#"<r xmlns:xenc="{xenc}" xmlns:ds="{DS}"><xenc:EncryptedData><xenc:EncryptionMethod Algorithm="{data}"/><ds:KeyInfo><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm="{key}"><ds:DigestMethod Algorithm="{oaep_digest}"/></xenc:EncryptionMethod></xenc:EncryptedKey></ds:KeyInfo></xenc:EncryptedData></r>"#
             )
         };
-        let parse_check = |xml: String| {
+        let check = |xml: String| {
             let doc = crate::xml::parse_secure(&xml).unwrap();
             validate_algorithms(&doc, doc.document_element().unwrap(), None)
         };
-        assert!(parse_check(enc(
+        assert!(check(enc(
             constants::ENC_AES256_CBC,
             constants::KEYTRANSPORT_RSA_OAEP_MGF1P,
             constants::DIGEST_SHA1
         ))
         .is_ok());
         assert!(matches!(
-            parse_check(enc(
+            check(enc(
                 "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
                 constants::KEYTRANSPORT_RSA_OAEP_MGF1P,
                 constants::DIGEST_SHA256
@@ -736,7 +679,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            parse_check(enc(
+            check(enc(
                 constants::ENC_AES256_CBC,
                 constants::KEYTRANSPORT_RSA_1_5,
                 constants::DIGEST_SHA256
@@ -759,11 +702,8 @@ mod tests {
         );
         let doc = crate::xml::parse_secure(&xml).unwrap();
         let root = doc.document_element().unwrap();
-        // A foreign key with a weak transport does not fail the message ...
         assert!(validate_algorithms(&doc, root, Some("urn:me")).is_ok());
-        // ... but without a recipient to compare against every key counts.
         assert!(validate_algorithms(&doc, root, None).is_err());
-        // And our own key using rsa-1_5 is rejected.
         let swapped = xml
             .replace(constants::KEYTRANSPORT_RSA_1_5, "TMP")
             .replace(
@@ -783,7 +723,6 @@ mod tests {
             r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" ID="_a">{}</samlp:ArtifactResponse>"#,
             sig("_a")
         );
-        // c14n before enveloped: rejected.
         let swapped = base.replacen(
             &format!(
                 r#"<ds:Transform Algorithm="{}"/><ds:Transform Algorithm="{}"/>"#,
@@ -803,7 +742,6 @@ mod tests {
             validate_algorithms(&doc, doc.document_element().unwrap(), None),
             Err(NlEidError::MalformedMessage(_))
         ));
-        // Only c14n, no enveloped transform: rejected.
         let no_env = base.replacen(
             &format!(
                 r#"<ds:Transform Algorithm="{}"/>"#,
@@ -832,7 +770,6 @@ mod tests {
             check_freshness(now + TimeDelta::hours(1), now, 30, 300, "x"),
             Err(NlEidError::StaleMessage { .. })
         ));
-        // The edges of chrono's range must be rejected, never panicked on.
         assert!(check_freshness(DateTime::<Utc>::MAX_UTC, now, 30, 300, "x").is_err());
         assert!(check_freshness(DateTime::<Utc>::MIN_UTC, now, 30, 300, "x").is_err());
     }
@@ -840,15 +777,25 @@ mod tests {
     #[test]
     fn test_insert_signature_as_first_child() {
         let xml = r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="a>b" ID="_m"><md:SPSSODescriptor/></md:EntityDescriptor>"#;
-        let out = insert_signature_as_first_child(xml, "<S/>").unwrap();
-        assert!(
-            out.contains(r#"ID="_m"><S/><md:SPSSODescriptor/>"#),
-            "{out}"
-        );
-        assert!(insert_signature_as_first_child(
-            r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"/>"#,
-            "<S/>"
+        let out = insert_signature_as_first_child(
+            xml,
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"/>"#,
         )
-        .is_err());
+        .unwrap();
+        let doc = crate::xml::parse_secure_metadata(&out).unwrap();
+        let root = doc.document_element().unwrap();
+        let children: Vec<NodeId> = doc
+            .children_iter(root)
+            .filter(|c| doc.element(*c).is_some())
+            .collect();
+        assert_eq!(children.len(), 2, "{out}");
+        assert!(is_element(&doc, children[0], DS, "Signature"));
+        assert!(is_element(
+            &doc,
+            children[1],
+            "urn:oasis:names:tc:SAML:2.0:metadata",
+            "SPSSODescriptor"
+        ));
+        assert_eq!(doc.get_attribute(root, "entityID"), Some("a>b"));
     }
 }

@@ -34,6 +34,15 @@
 //!   IdP metadata (§8.5) that yields the endpoints and a `KeysManager` keyed by
 //!   `<ds:KeyName>`.
 //! - [`logout`] — `LogoutResponse` validation (§7.7.2).
+//! - [`rd`] — the RD side of the same messages (§7.6, §7.8), built from the
+//!   typed protocol structs, for RD mocks and conformance tests.
+//!
+//! Like [`crate::profiles::swedenconnect`], the module works on the typed
+//! model: messages are read with the crate's deserializers and written with
+//! its serializers and [`crate::xml::XmlWriter`]; the document tree is only
+//! consulted where the typed model cannot carry the information (which
+//! `<ds:Signature>` belongs to which element, and the `<saml:EncryptedID>`
+//! elements that are handed to the decryptor as standalone documents).
 //!
 //! ## Scope
 //!
@@ -54,6 +63,7 @@ pub mod entity_id;
 pub mod error;
 pub mod logout;
 pub mod metadata;
+pub mod rd;
 pub mod request;
 pub mod response;
 mod xmlutil;
@@ -73,6 +83,7 @@ pub use request::{
     signed_logout_request, AcsTarget, NlEidAuthnOptions, ServiceReference, SignedMessage,
 };
 pub use response::{
-    process_artifact_response, ArtifactResponseParams, AuthnOutcome, DvDecryptionKeys,
-    IdentifierType, NlEidAuthnResult, SubjectId,
+    check_artifact_response, is_cancellation_status, process_artifact_response, validate_response,
+    ArtifactResponseParams, AuthnOutcome, DvDecryptionKeys, IdentifierType, NlEidAuthnResult,
+    ResponseVerdict, SubjectId, ValidatedAssertion,
 };

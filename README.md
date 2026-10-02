@@ -93,6 +93,15 @@ cleartext assertions and encrypted identifiers only:
   `KeyName`-named certificates, and a reader for the RD metadata (section 8.5)
   that yields the endpoints and a `KeysManager` keyed by `KeyName`.
 - **Logout** -- `LogoutResponse` validation (section 7.7.2).
+- **RD-side builders** -- `nl_eid::rd` builds the messages a Routeringsdienst
+  sends (`Response` with the section 7.6.3 `Assertion`, `ArtifactResponse`,
+  the section 7.8 statuses, `EncryptedID` identifiers, `KeyName`-only RD
+  signatures) from the typed protocol structs, for RD mocks and tests.
+
+Like the Sweden Connect profile, the module works on the typed model (the
+crate's deserializers, serializers and `XmlWriter`) and uses the document tree
+only for what the typed model cannot carry: which `ds:Signature` belongs to
+which element, and the `EncryptedID` elements handed to the decryptor.
 
 The DV role is complete; the cluster-connection-provider (LC) role is not
 modelled. Trust in the RD metadata document (PKIoverheid chain, OIN), the

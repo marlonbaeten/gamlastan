@@ -522,7 +522,7 @@ fn select_artifact_resolution_service(
 
 /// The `<ds:KeyName>` inside a raw `<ds:KeyInfo>` fragment, if any. The
 /// fragment may rely on an `xmlns:ds` declared on an ancestor, so the
-/// conventional prefix is pre-declared on a wrapper.
+/// conventional prefixes are pre-declared on a wrapper element.
 fn key_name_from_key_info(key_info_xml: &str) -> Option<String> {
     if key_info_xml.trim().is_empty() {
         return None;
@@ -535,9 +535,9 @@ fn key_name_from_key_info(key_info_xml: &str) -> Option<String> {
     );
     let doc = crate::xml::parse_secure_metadata(&wrapped).ok()?;
     let root = doc.document_element()?;
-    let key_info = xmlutil::element_child(&doc, root, constants::NS_DS, "KeyInfo")?;
-    let key_name = xmlutil::element_child(&doc, key_info, constants::NS_DS, "KeyName")?;
-    xmlutil::text_only(&doc, key_name).filter(|s| !s.is_empty())
+    let key_info = doc.first_child_element_by_name_ns(root, constants::NS_DS, "KeyInfo")?;
+    let key_name = doc.first_child_element_by_name_ns(key_info, constants::NS_DS, "KeyName")?;
+    xmlutil::element_text(&doc, key_name).filter(|s| !s.is_empty())
 }
 
 /// Parse an RD IdP metadata document (§8.5) into [`RdMetadata`].

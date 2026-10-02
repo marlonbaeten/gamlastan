@@ -1,24 +1,39 @@
 //! End-to-end tests for the Dutch eID SAML (DV ↔ RD) profile.
 //!
 //! An RD-signed SOAP `ArtifactResponse` → `Response` → `Assertion` chain is
-//! built and signed here with dedicated test keys, exactly as a Routeringsdienst
-//! emits it (RD signatures on the ArtifactResponse and the Assertion, an
-//! `EncryptedID` for the acting subject wrapped to the DV encryption key,
-//! `KeyName`-only KeyInfo), and driven through `process_artifact_response`.
-//! Only the mTLS back-channel that would deliver these bytes is left out.
+//! built here from the typed protocol structs through `profiles::nl_eid::rd`
+//! and signed with dedicated test keys, exactly as a Routeringsdienst emits it
+//! (RD signatures on the ArtifactResponse and the Assertion, an `EncryptedID`
+//! for the acting subject wrapped to the DV encryption key, `KeyName`-only
+//! KeyInfo), and driven through `process_artifact_response`. Only the mTLS
+//! back-channel that would deliver these bytes is left out.
 
 use base64::Engine;
 use chrono::{Duration, Utc};
 
+use gamlastan::core::assertion::name_id::NameId;
+use gamlastan::core::assertion::types::{Assertion, EncryptedAssertion};
+use gamlastan::core::identifiers::SamlVersion;
+use gamlastan::core::protocol::logout::LogoutResponse;
+use gamlastan::core::protocol::response::Response;
+use gamlastan::core::protocol::status::Status;
 use gamlastan::crypto::keys::loader;
-use gamlastan::crypto::{KeyUsage, KeysManager, SamlEncryptor, SamlSigner, SamlVerifier};
-use gamlastan::profiles::nl_eid::{
-    build_dv_metadata, constants, parse_rd_metadata, sign_element_xml, sign_message_xml,
-    signed_artifact_resolve, signed_authn_request, signed_logout_request, validate_logout_response,
-    ArtifactResponseParams, AuthnOutcome, DvDecryptionKeys, DvMetadataOptions, IdentifierType,
-    LevelOfAssurance, NlEidAuthnOptions, NlEidConfig, NlEidError, PublishedCertificate, RdMetadata,
+use gamlastan::crypto::{KeyUsage, KeysManager, SamlSigner, SamlVerifier};
+use gamlastan::profiles::nl_eid::rd::{
+    cancel_status, create_artifact_response, create_artifact_response_error, create_error_response,
+    create_response, encrypt_subject_id, encrypted_id_attribute_value, request_denied_status,
+    request_unsupported_status, sign_rd_element_xml, signed_artifact_response_xml,
+    RdResponseOptions, RdSubject,
 };
+use gamlastan::profiles::nl_eid::{
+    build_dv_metadata, constants, parse_rd_metadata, sign_element_xml, signed_artifact_resolve,
+    signed_authn_request, signed_logout_request, validate_logout_response, ArtifactResponseParams,
+    AuthnOutcome, DvDecryptionKeys, DvMetadataOptions, IdentifierType, LevelOfAssurance,
+    NlEidAuthnOptions, NlEidConfig, NlEidError, PublishedCertificate, RdMetadata,
+};
+use gamlastan::profiles::sso::web_browser::ResponseTimes;
 use gamlastan::security::replay::InMemoryReplayCache;
+use gamlastan::xml::serialize::SamlSerialize;
 
 const RD_SIGNING_CERT: &str = include_str!("fixtures/nl_eid/rd-signing-cert.pem");
 const RD_SIGNING_KEY: &str = include_str!("fixtures/nl_eid/rd-signing-key.pem");
@@ -30,6 +45,7 @@ const DV_ENCRYPTION_2_CERT: &str = include_str!("fixtures/nl_eid/dv-encryption-2
 const DV_ENCRYPTION_2_KEY: &str = include_str!("fixtures/nl_eid/dv-encryption-2-key.pem");
 
 const DV: &str = "urn:nl-eid-gdi:1.0:DV:00000001234567890000:entities:9001";
+const OTHER_DV: &str = "urn:nl-eid-gdi:1.0:DV:00000000000000000001:entities:0001";
 const RD: &str = "urn:nl-eid-gdi:1.0:RD:00000004000000149000:entities:9002";
 const AD: &str = "urn:nl-eid-gdi:1.0:AD:00000004166909913000:entities:9002";
 const ACS: &str = "https://dv.example.nl/saml/acs";
@@ -37,12 +53,14 @@ const SLS: &str = "https://dv.example.nl/saml/slo";
 const SERVICE_UUID: &str = "f847dc11-ac24-47b2-84a8-a057440ce56d";
 const RESOLVE_ID: &str = "_resolve1";
 const AUTHN_ID: &str = "_authn1";
+const RESPONSE_ID: &str = "_response1";
+const ASSERTION_ID: &str = "_assertion1";
+const TRANSIENT_ID: &str = "64b0d194095940008ffa142b12444c01";
 const BSN: &str = "900070341";
 
 const SAML: &str = constants::NS_SAML_ASSERTION;
 const SAMLP: &str = constants::NS_SAML_PROTOCOL;
 const XENC: &str = constants::NS_XENC;
-const DS: &str = constants::NS_DS;
 
 // ── Key material ────────────────────────────────────────────────────────────
 
@@ -52,6 +70,12 @@ fn cert_der_b64(cert_pem: &str) -> String {
         .filter(|l| !l.starts_with("-----"))
         .map(str::trim)
         .collect()
+}
+
+fn cert_der(cert_pem: &str) -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode(cert_der_b64(cert_pem))
+        .expect("certificate DER")
 }
 
 fn signer(key_pem: &str) -> SamlSigner {
@@ -94,6 +118,10 @@ fn rd_verifier() -> SamlVerifier {
     rd_metadata().verifier().expect("verifier")
 }
 
+fn rd_key_name() -> String {
+    published(RD_SIGNING_CERT).key_name
+}
+
 fn dv_keys() -> DvDecryptionKeys {
     DvDecryptionKeys::from_private_key_pems([DV_ENCRYPTION_KEY.as_bytes()]).expect("DV keys")
 }
@@ -115,36 +143,29 @@ fn params<'a>(cache: &'a InMemoryReplayCache) -> ArtifactResponseParams<'a> {
 
 // ── Message construction (the RD side) ──────────────────────────────────────
 
-fn ts(offset: Duration) -> String {
-    (Utc::now() + offset)
-        .format("%Y-%m-%dT%H:%M:%SZ")
-        .to_string()
+/// A §7.6.3.4.4 persistent `NameID` carrying a legacy BSN.
+fn bsn_name_id(value: &str) -> NameId {
+    NameId {
+        value: value.to_string(),
+        format: Some(constants::NAMEID_PERSISTENT.to_string()),
+        name_qualifier: Some(constants::ID_TYPE_LEGACY_BSN.to_string()),
+        sp_name_qualifier: None,
+        sp_provided_id: None,
+    }
 }
 
-/// An `EncryptedID` carrying `name_id_xml`, wrapped to `cert_pem` for
-/// `recipient` with the inline-`EncryptedKey` layout (AES-256-CBC data,
-/// RSA-OAEP key transport, §9.3).
-fn encrypted_id_inline(cert_pem: &str, recipient: &str, name_id_xml: &str) -> String {
+/// An `EncryptedID` carrying `name_id`, wrapped to `cert_pem` for `recipient`
+/// with the inline-`EncryptedKey` layout (AES-256-CBC data, RSA-OAEP key
+/// transport, §9.3).
+fn encrypted_id(cert_pem: &str, recipient: &str, name_id: &NameId) -> String {
     let cert = published(cert_pem);
-    let key_name = &cert.key_name;
-    let template = format!(
-        r#"<saml:EncryptedID xmlns:saml="{SAML}" xmlns:xenc="{XENC}" xmlns:ds="{DS}"><xenc:EncryptedData Type="http://www.w3.org/2001/04/xmlenc#Element"><xenc:EncryptionMethod Algorithm="{}"/><ds:KeyInfo><xenc:EncryptedKey Recipient="{recipient}"><xenc:EncryptionMethod Algorithm="{}"/><ds:KeyInfo><ds:KeyName>{key_name}</ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue></xenc:CipherValue></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue></xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedID>"#,
-        constants::ENC_AES256_CBC,
-        constants::KEYTRANSPORT_RSA_OAEP_MGF1P,
-    );
-    let recipient_key = loader::load_x509_cert_pem(cert_pem.as_bytes())
-        .expect("recipient cert")
-        .with_name(key_name.clone());
-    let mut km = KeysManager::new();
-    km.add_key(recipient_key);
-    SamlEncryptor::new(km)
-        .encrypt(&template, name_id_xml.as_bytes())
+    encrypt_subject_id(name_id, recipient, &cert_der(cert_pem), &cert.key_name)
         .expect("encrypt NameID")
 }
 
-/// Rewrite an inline-layout `EncryptedID` into the layout TVS actually emits:
-/// the `EncryptedKey` as a sibling of `EncryptedData`, referenced through a
-/// `ds:RetrievalMethod`, with `Id` attributes and a `ReferenceList`.
+/// Rewrite an inline-layout `EncryptedID` into the layout TVS actually emits
+/// on the wire: the `EncryptedKey` as a sibling of `EncryptedData`, referenced
+/// through a `ds:RetrievalMethod`, with `Id` attributes and a `ReferenceList`.
 fn to_retrieval_layout(inline: &str, suffix: &str) -> String {
     let ek_start = inline.find("<xenc:EncryptedKey").expect("EncryptedKey");
     let ek_end = inline
@@ -193,14 +214,6 @@ fn to_retrieval_layout(inline: &str, suffix: &str) -> String {
     )
 }
 
-fn bsn_name_id(value: &str) -> String {
-    format!(
-        r#"<saml:NameID xmlns:saml="{SAML}" Format="{}" NameQualifier="{}">{value}</saml:NameID>"#,
-        constants::NAMEID_PERSISTENT,
-        constants::ID_TYPE_LEGACY_BSN
-    )
-}
-
 enum Outcome {
     Success,
     Cancelled,
@@ -221,12 +234,14 @@ struct Wire {
     rd_key_name: Option<String>,
     sign_assertion: bool,
     audience: &'static str,
-    loa: &'static str,
+    /// The AuthnContextClassRef; `None` is the eIDAS spelling of Substantial.
+    loa: Option<&'static str>,
     service_uuid: &'static str,
-    /// The acting-subject EncryptedID XML; `None` omits the attribute.
-    acting_subject: Option<String>,
-    /// An extra Response child (e.g. an EncryptedAssertion).
-    response_extra: String,
+    /// The `ActingSubjectID` attribute values (one `EncryptedID` XML each);
+    /// empty omits the attribute.
+    acting_subject: Vec<String>,
+    /// Add an `EncryptedAssertion` to the Response.
+    encrypted_assertion: bool,
     /// Shift of every timestamp relative to now.
     time_offset: Duration,
     /// Declare the SAML namespaces on the SOAP envelope rather than on the
@@ -246,143 +261,135 @@ impl Default for Wire {
             rd_key_name: None,
             sign_assertion: true,
             audience: DV,
-            loa: constants::LOA_SUBSTANTIAL_EIDAS,
+            loa: None,
             service_uuid: SERVICE_UUID,
-            acting_subject: Some(encrypted_id_inline(
-                DV_ENCRYPTION_CERT,
-                DV,
-                &bsn_name_id(BSN),
-            )),
-            response_extra: String::new(),
+            acting_subject: vec![encrypted_id(DV_ENCRYPTION_CERT, DV, &bsn_name_id(BSN))],
+            encrypted_assertion: false,
             time_offset: Duration::zero(),
             namespaces_on_envelope: false,
         }
     }
 }
 
-fn status_xml(outcome: &Outcome) -> String {
-    match outcome {
-        Outcome::Success => format!(
-            r#"<samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status>"#,
-            constants::STATUS_SUCCESS
+/// The AD's own assertion as the RD places it in `<saml:Advice>` (§7.6.3):
+/// evidence only, not consumed.
+fn ad_advice_assertion(times: ResponseTimes) -> Assertion {
+    let opts = RdResponseOptions::new(
+        AD,
+        RD,
+        "https://rd.example/acs",
+        "_rd-to-ad",
+        SERVICE_UUID,
+        LevelOfAssurance::Substantial,
+        RdSubject::new(
+            "ad-transient",
+            r#"<saml:EncryptedID xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"/>"#,
         ),
-        Outcome::Cancelled => format!(
-            r#"<samlp:Status><samlp:StatusCode Value="{}"><samlp:StatusCode Value="{}"/></samlp:StatusCode><samlp:StatusMessage>{}</samlp:StatusMessage></samlp:Status>"#,
-            constants::STATUS_RESPONDER,
-            constants::STATUS_AUTHN_FAILED,
-            constants::STATUS_MESSAGE_CANCELLED
+    );
+    let mut assertion = create_response(&opts, times).assertions.remove(0);
+    assertion.id = "_ad1".to_string();
+    assertion
+}
+
+/// The typed `Response` for `wire`.
+fn response_for(wire: &Wire) -> Response {
+    let now = Utc::now() + wire.time_offset;
+    let times = ResponseTimes::at(now);
+    match wire.outcome {
+        Outcome::Cancelled => {
+            create_error_response(RD, wire.response_in_response_to, ACS, cancel_status(), now)
+        }
+        Outcome::Failed => create_error_response(
+            RD,
+            wire.response_in_response_to,
+            ACS,
+            request_unsupported_status("Level of assurance not supported"),
+            now,
         ),
-        Outcome::Failed => format!(
-            r#"<samlp:Status><samlp:StatusCode Value="{}"><samlp:StatusCode Value="{}"/></samlp:StatusCode><samlp:StatusMessage>Level of assurance not supported</samlp:StatusMessage></samlp:Status>"#,
-            constants::STATUS_RESPONDER,
-            constants::STATUS_REQUEST_UNSUPPORTED
-        ),
+        Outcome::Success => {
+            let mut opts = RdResponseOptions::new(
+                RD,
+                wire.audience,
+                ACS,
+                wire.response_in_response_to,
+                wire.service_uuid,
+                LevelOfAssurance::Substantial,
+                RdSubject::new(
+                    TRANSIENT_ID,
+                    wire.acting_subject.first().cloned().unwrap_or_default(),
+                ),
+            );
+            opts.authenticating_authorities = vec![AD.to_string()];
+            opts.advice = vec![ad_advice_assertion(times)];
+            let mut response = create_response(&opts, times);
+            response.base.id = RESPONSE_ID.to_string();
+
+            let assertion = &mut response.assertions[0];
+            assertion.id = ASSERTION_ID.to_string();
+            assertion.has_signature = wire.sign_assertion;
+            let scd = assertion.subject.as_mut().unwrap().subject_confirmations[0]
+                .subject_confirmation_data
+                .as_mut()
+                .unwrap();
+            scd.in_response_to = Some(wire.assertion_in_response_to.to_string());
+            if let Some(loa) = wire.loa {
+                assertion.authn_statements[0]
+                    .authn_context
+                    .authn_context_class_ref = Some(loa.to_string());
+            }
+            let attributes = &mut assertion.attribute_statements[0].attributes;
+            if wire.acting_subject.is_empty() {
+                attributes.retain(|a| a.name != constants::ATTR_ACTING_SUBJECT_ID);
+            } else {
+                attributes[0].values = wire
+                    .acting_subject
+                    .iter()
+                    .map(|xml| encrypted_id_attribute_value(xml))
+                    .collect();
+            }
+
+            if wire.encrypted_assertion {
+                let raw = format!(
+                    r#"<saml:EncryptedAssertion xmlns:saml="{SAML}"><xenc:EncryptedData xmlns:xenc="{XENC}"><xenc:EncryptionMethod Algorithm="{}"/><xenc:CipherData><xenc:CipherValue>AA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>"#,
+                    constants::ENC_AES256_CBC
+                );
+                response.encrypted_assertions.push(EncryptedAssertion {
+                    raw: raw.into_bytes(),
+                });
+            }
+            response
+        }
     }
-}
-
-/// The RD signature template as TVS emits it: `KeyInfo` with a `KeyName` only.
-fn rd_signature_template(id: &str, key_name: &str) -> String {
-    format!(
-        r##"<dsig:Signature xmlns:dsig="{DS}"><dsig:SignedInfo><dsig:CanonicalizationMethod Algorithm="{}"/><dsig:SignatureMethod Algorithm="{}"/><dsig:Reference URI="#{id}"><dsig:Transforms><dsig:Transform Algorithm="{}"/><dsig:Transform Algorithm="{}"/></dsig:Transforms><dsig:DigestMethod Algorithm="{}"/><dsig:DigestValue></dsig:DigestValue></dsig:Reference></dsig:SignedInfo><dsig:SignatureValue></dsig:SignatureValue><dsig:KeyInfo><dsig:KeyName>{key_name}</dsig:KeyName></dsig:KeyInfo></dsig:Signature>"##,
-        constants::C14N_EXCLUSIVE,
-        constants::SIG_RSA_SHA256,
-        constants::TRANSFORM_ENVELOPED_SIGNATURE,
-        constants::C14N_EXCLUSIVE,
-        constants::DIGEST_SHA256,
-    )
-}
-
-/// Sign `xml` as the RD: the template goes right after the first
-/// `</saml:Issuer>` of the element carrying `id`.
-fn rd_sign(xml: &str, id: &str, wire: &Wire) -> String {
-    let key_name = wire
-        .rd_key_name
-        .clone()
-        .unwrap_or_else(|| published(RD_SIGNING_CERT).key_name);
-    let template = rd_signature_template(id, &key_name);
-    let marker = format!(r#"ID="{id}""#);
-    let elem_at = xml.find(&marker).expect("element with id");
-    let issuer_end =
-        xml[elem_at..].find("</saml:Issuer>").expect("issuer") + "</saml:Issuer>".len();
-    let at = elem_at + issuer_end;
-    let with_template = format!("{}{}{}", &xml[..at], template, &xml[at..]);
-    signer(wire.rd_signing_key)
-        .sign_enveloped(&with_template)
-        .expect("RD signs")
-}
-
-fn assertion_xml(wire: &Wire) -> String {
-    let issued = ts(wire.time_offset);
-    let scd_expiry = ts(wire.time_offset + Duration::minutes(2));
-    let not_before = ts(wire.time_offset - Duration::minutes(2));
-    let not_on_or_after = ts(wire.time_offset + Duration::minutes(2));
-    let acting = wire
-        .acting_subject
-        .as_ref()
-        .map(|enc| {
-            format!(
-                r#"<saml:Attribute Name="{}"><saml:AttributeValue>{enc}</saml:AttributeValue></saml:Attribute>"#,
-                constants::ATTR_ACTING_SUBJECT_ID
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        r#"<saml:Assertion ID="_assertion1" Version="2.0" IssueInstant="{issued}"><saml:Issuer>{RD}</saml:Issuer><saml:Subject><saml:NameID>64b0d194095940008ffa142b12444c01</saml:NameID><saml:SubjectConfirmation Method="{}"><saml:SubjectConfirmationData InResponseTo="{}" NotOnOrAfter="{scd_expiry}" Recipient="{ACS}"/></saml:SubjectConfirmation></saml:Subject><saml:Conditions NotBefore="{not_before}" NotOnOrAfter="{not_on_or_after}"><saml:AudienceRestriction><saml:Audience>{}</saml:Audience></saml:AudienceRestriction></saml:Conditions><saml:Advice><saml:Assertion ID="_ad1" Version="2.0" IssueInstant="{issued}"><saml:Issuer>{AD}</saml:Issuer><saml:Subject><saml:NameID Format="{}">ad-transient</saml:NameID></saml:Subject><saml:AuthnStatement AuthnInstant="{issued}"><saml:AuthnContext><saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef></saml:AuthnContext></saml:AuthnStatement></saml:Assertion></saml:Advice><saml:AuthnStatement AuthnInstant="{issued}"><saml:AuthnContext><saml:AuthnContextClassRef>{}</saml:AuthnContextClassRef><saml:AuthenticatingAuthority>{AD}</saml:AuthenticatingAuthority></saml:AuthnContext></saml:AuthnStatement><saml:AttributeStatement>{acting}<saml:Attribute Name="{}"><saml:AttributeValue>{}</saml:AttributeValue></saml:Attribute></saml:AttributeStatement></saml:Assertion>"#,
-        constants::CM_BEARER,
-        wire.assertion_in_response_to,
-        wire.audience,
-        constants::NAMEID_TRANSIENT,
-        wire.loa,
-        wire.loa,
-        constants::ATTR_SERVICE_UUID,
-        wire.service_uuid,
-    )
 }
 
 /// The complete SOAP body the back-channel returns for `wire`.
 fn soap_artifact_response(wire: &Wire) -> String {
-    let issued = ts(wire.time_offset);
-    let response = if wire.artifact_resolved {
-        let assertion = match wire.outcome {
-            Outcome::Success => assertion_xml(wire),
-            Outcome::Cancelled | Outcome::Failed => String::new(),
-        };
-        format!(
-            r#"<samlp:Response ID="_response1" Version="2.0" IssueInstant="{issued}" Destination="{ACS}" InResponseTo="{}"><saml:Issuer>{RD}</saml:Issuer>{}{}{assertion}</samlp:Response>"#,
-            wire.response_in_response_to,
-            status_xml(&wire.outcome),
-            wire.response_extra,
-        )
+    let mut artifact_response = if wire.artifact_resolved {
+        create_artifact_response(RD, wire.resolve_id, &response_for(wire)).expect("wrap")
     } else {
-        String::new()
+        create_artifact_response_error(RD, wire.resolve_id, request_denied_status())
     };
-    let art_status = if wire.artifact_resolved {
-        status_xml(&Outcome::Success)
-    } else {
-        format!(
-            r#"<samlp:Status><samlp:StatusCode Value="{}"><samlp:StatusCode Value="{}"/></samlp:StatusCode></samlp:Status>"#,
-            constants::STATUS_REQUESTER,
-            constants::STATUS_REQUEST_DENIED
-        )
-    };
-    let unsigned = format!(
-        r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" xmlns:saml="{SAML}" ID="_artifactresponse1" Version="2.0" IssueInstant="{issued}" InResponseTo="{}"><saml:Issuer>{RD}</saml:Issuer>{art_status}{response}</samlp:ArtifactResponse>"#,
-        wire.resolve_id
-    );
+    artifact_response.id = "_artifactresponse1".to_string();
+    artifact_response.issue_instant = Utc::now() + wire.time_offset;
 
     // The RD signs the assertion first, then the enveloping ArtifactResponse.
-    let mut signed = unsigned;
-    if wire.sign_assertion && matches!(wire.outcome, Outcome::Success) && wire.artifact_resolved {
-        signed = rd_sign(&signed, "_assertion1", wire);
-    }
-    signed = rd_sign(&signed, "_artifactresponse1", wire);
+    let sign_assertion =
+        wire.sign_assertion && wire.artifact_resolved && matches!(wire.outcome, Outcome::Success);
+    let key_name = wire.rd_key_name.clone().unwrap_or_else(rd_key_name);
+    let signed = signed_artifact_response_xml(
+        &artifact_response,
+        sign_assertion.then_some(ASSERTION_ID),
+        &signer(wire.rd_signing_key),
+        &key_name,
+    )
+    .expect("RD signs");
 
     if wire.namespaces_on_envelope {
         // Exclusive c14n renders visibly used namespaces on the apex element,
         // so moving the declarations to the envelope leaves the digest intact.
         let decls = format!(r#" xmlns:samlp="{SAMLP}" xmlns:saml="{SAML}""#);
         let stripped = signed.replacen(&decls, "", 1);
-        assert_ne!(stripped, signed);
+        assert_ne!(stripped, signed, "{signed}");
         format!(
             r#"<soapenv:Envelope xmlns:soapenv="{}"{decls}><soapenv:Body>{stripped}</soapenv:Body></soapenv:Envelope>"#,
             constants::NS_SOAP11
@@ -390,6 +397,21 @@ fn soap_artifact_response(wire: &Wire) -> String {
     } else {
         gamlastan::bindings::soap::soap_envelope_wrap(&signed, None)
     }
+}
+
+fn process(
+    cfg: &NlEidConfig,
+    body: &str,
+    keys: &DvDecryptionKeys,
+    cache: &InMemoryReplayCache,
+) -> Result<AuthnOutcome, NlEidError> {
+    gamlastan::profiles::nl_eid::process_artifact_response(
+        cfg,
+        body,
+        &rd_verifier(),
+        keys,
+        &params(cache),
+    )
 }
 
 fn run(wire: &Wire) -> Result<AuthnOutcome, NlEidError> {
@@ -402,13 +424,7 @@ fn run_with(
     keys: &DvDecryptionKeys,
 ) -> Result<AuthnOutcome, NlEidError> {
     let cache = InMemoryReplayCache::new();
-    gamlastan::profiles::nl_eid::process_artifact_response(
-        cfg,
-        &soap_artifact_response(wire),
-        &rd_verifier(),
-        keys,
-        &params(&cache),
-    )
+    process(cfg, &soap_artifact_response(wire), keys, &cache)
 }
 
 fn authenticated(
@@ -431,17 +447,14 @@ fn a_valid_artifact_response_authenticates_the_subject() {
         IdentifierType::LegacyBsn
     );
     assert!(result.legal_subject.is_none());
-    assert_eq!(result.transient_name_id, "64b0d194095940008ffa142b12444c01");
+    assert_eq!(result.transient_name_id, TRANSIENT_ID);
     assert_eq!(result.level_of_assurance, LevelOfAssurance::Substantial);
     assert_eq!(result.authenticating_authorities, vec![AD.to_string()]);
     assert_eq!(result.service_uuid, SERVICE_UUID);
-    assert_eq!(
-        result.rd_signing_key_name,
-        published(RD_SIGNING_CERT).key_name
-    );
+    assert_eq!(result.rd_signing_key_name, rd_key_name());
     assert_eq!(result.authn.idp_entity_id, RD);
-    assert_eq!(result.authn.assertion_id, "_assertion1");
-    assert_eq!(result.authn.response_id, "_response1");
+    assert_eq!(result.authn.assertion_id, ASSERTION_ID);
+    assert_eq!(result.authn.response_id, RESPONSE_ID);
     // The debug form of the result never shows the BSN.
     assert!(!format!("{result:?}").contains(BSN));
 }
@@ -458,9 +471,9 @@ fn namespaces_declared_on_the_soap_envelope_still_verify() {
 
 #[test]
 fn the_tvs_retrieval_method_layout_decrypts() {
-    let inline = encrypted_id_inline(DV_ENCRYPTION_CERT, DV, &bsn_name_id(BSN));
+    let inline = encrypted_id(DV_ENCRYPTION_CERT, DV, &bsn_name_id(BSN));
     let wire = Wire {
-        acting_subject: Some(to_retrieval_layout(&inline, "-1")),
+        acting_subject: vec![to_retrieval_layout(&inline, "-1")],
         ..Wire::default()
     };
     let result = authenticated(run(&wire));
@@ -468,18 +481,45 @@ fn the_tvs_retrieval_method_layout_decrypts() {
 }
 
 #[test]
+fn a_legal_subject_is_decrypted_alongside_the_acting_subject() {
+    let mut response = response_for(&Wire::default());
+    let legal = encrypted_id(DV_ENCRYPTION_CERT, DV, &bsn_name_id("000000012"));
+    let attributes = &mut response.assertions[0].attribute_statements[0].attributes;
+    attributes.insert(
+        1,
+        gamlastan::core::assertion::attribute::Attribute {
+            name: constants::ATTR_LEGAL_SUBJECT_ID.to_string(),
+            name_format: None,
+            friendly_name: None,
+            values: vec![encrypted_id_attribute_value(&legal)],
+        },
+    );
+    let art = create_artifact_response(RD, RESOLVE_ID, &response).unwrap();
+    let signed = signed_artifact_response_xml(
+        &art,
+        Some(ASSERTION_ID),
+        &signer(RD_SIGNING_KEY),
+        &rd_key_name(),
+    )
+    .unwrap();
+    let cache = InMemoryReplayCache::new();
+    let body = gamlastan::bindings::soap::soap_envelope_wrap(&signed, None);
+    let result = authenticated(process(&cfg(), &body, &dv_keys(), &cache));
+    assert_eq!(result.acting_subject.expose_value(), BSN);
+    assert_eq!(
+        result.legal_subject.as_ref().unwrap().expose_value(),
+        "000000012"
+    );
+}
+
+#[test]
 fn keys_wrapped_for_another_recipient_are_ignored() {
     // Two EncryptedIDs for the attribute (one per recipient, §7.6.3.4), the
     // foreign one first and wrapped to a key we do not hold.
-    let foreign = encrypted_id_inline(
-        DV_ENCRYPTION_2_CERT,
-        "urn:nl-eid-gdi:1.0:DV:00000000000000000001:entities:0001",
-        &bsn_name_id("000000000"),
-    );
-    let ours = encrypted_id_inline(DV_ENCRYPTION_CERT, DV, &bsn_name_id(BSN));
-    let attribute_values = format!("{foreign}</saml:AttributeValue><saml:AttributeValue>{ours}");
+    let foreign = encrypted_id(DV_ENCRYPTION_2_CERT, OTHER_DV, &bsn_name_id("000000000"));
+    let ours = encrypted_id(DV_ENCRYPTION_CERT, DV, &bsn_name_id(BSN));
     let wire = Wire {
-        acting_subject: Some(attribute_values),
+        acting_subject: vec![foreign, ours],
         ..Wire::default()
     };
     let result = authenticated(run(&wire));
@@ -489,11 +529,7 @@ fn keys_wrapped_for_another_recipient_are_ignored() {
 #[test]
 fn a_message_wrapped_to_the_rollover_key_decrypts_with_the_second_key() {
     let wire = Wire {
-        acting_subject: Some(encrypted_id_inline(
-            DV_ENCRYPTION_2_CERT,
-            DV,
-            &bsn_name_id(BSN),
-        )),
+        acting_subject: vec![encrypted_id(DV_ENCRYPTION_2_CERT, DV, &bsn_name_id(BSN))],
         ..Wire::default()
     };
     // Only the first key: fails.
@@ -637,21 +673,20 @@ fn a_signed_element_wrapped_in_a_forged_artifact_response_is_rejected() {
     let inner_end =
         genuine.rfind("</samlp:ArtifactResponse>").unwrap() + "</samlp:ArtifactResponse>".len();
     let inner = &genuine[inner_start..inner_end];
-    let sig_start = inner.find("<dsig:Signature").unwrap();
-    let sig_end = inner.find("</dsig:Signature>").unwrap() + "</dsig:Signature>".len();
+    let sig_start = inner.find("<ds:Signature").unwrap();
+    let sig_end = inner.find("</ds:Signature>").unwrap() + "</ds:Signature>".len();
     let signature = &inner[sig_start..sig_end];
-    let now = ts(Duration::zero());
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
     let forged = format!(
         r#"<samlp:ArtifactResponse xmlns:samlp="{SAMLP}" xmlns:saml="{SAML}" ID="_forged" Version="2.0" IssueInstant="{now}" InResponseTo="{RESOLVE_ID}"><saml:Issuer>{RD}</saml:Issuer>{signature}<samlp:Extensions>{inner}</samlp:Extensions><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:ArtifactResponse>"#,
         constants::STATUS_SUCCESS
     );
     let cache = InMemoryReplayCache::new();
-    let err = gamlastan::profiles::nl_eid::process_artifact_response(
+    let err = process(
         &cfg(),
         &gamlastan::bindings::soap::soap_envelope_wrap(&forged, None),
-        &rd_verifier(),
         &dv_keys(),
-        &params(&cache),
+        &cache,
     )
     .unwrap_err();
     assert!(
@@ -668,7 +703,7 @@ fn a_signed_element_wrapped_in_a_forged_artifact_response_is_rejected() {
 #[test]
 fn an_assertion_for_another_dv_is_rejected() {
     let err = run(&Wire {
-        audience: "urn:nl-eid-gdi:1.0:DV:00000000000000000001:entities:0001",
+        audience: OTHER_DV,
         ..Wire::default()
     })
     .unwrap_err();
@@ -680,20 +715,20 @@ fn an_assertion_for_another_dv_is_rejected() {
 fn a_level_of_assurance_below_the_minimum_is_rejected_and_a_higher_one_accepted() {
     assert!(matches!(
         run(&Wire {
-            loa: constants::LOA_BASIC,
+            loa: Some(constants::LOA_BASIC),
             ..Wire::default()
         }),
         Err(NlEidError::LevelOfAssuranceTooLow { .. })
     ));
     assert!(matches!(
         run(&Wire {
-            loa: "urn:bogus:loa",
+            loa: Some("urn:bogus:loa"),
             ..Wire::default()
         }),
         Err(NlEidError::UnknownLevelOfAssurance(_))
     ));
     let result = authenticated(run(&Wire {
-        loa: constants::LOA_HIGH,
+        loa: Some(constants::LOA_HIGH),
         ..Wire::default()
     }));
     assert_eq!(result.level_of_assurance, LevelOfAssurance::High);
@@ -714,18 +749,18 @@ fn a_service_uuid_for_another_service_is_rejected() {
 fn an_encrypted_id_without_a_key_for_us_is_rejected() {
     assert!(matches!(
         run(&Wire {
-            acting_subject: Some(encrypted_id_inline(
+            acting_subject: vec![encrypted_id(
                 DV_ENCRYPTION_CERT,
-                "urn:nl-eid-gdi:1.0:DV:00000000000000000001:entities:0001",
+                OTHER_DV,
                 &bsn_name_id(BSN)
-            )),
+            )],
             ..Wire::default()
         }),
         Err(NlEidError::NoEncryptedKeyForRecipient { .. })
     ));
     assert!(matches!(
         run(&Wire {
-            acting_subject: None,
+            acting_subject: vec![],
             ..Wire::default()
         }),
         Err(NlEidError::MissingActingSubjectId)
@@ -734,14 +769,13 @@ fn an_encrypted_id_without_a_key_for_us_is_rejected() {
 
 #[test]
 fn a_decrypted_name_id_of_the_wrong_shape_is_rejected() {
-    let transient = format!(
-        r#"<saml:NameID xmlns:saml="{SAML}" Format="{}" NameQualifier="{}">{BSN}</saml:NameID>"#,
-        constants::NAMEID_TRANSIENT,
-        constants::ID_TYPE_LEGACY_BSN
-    );
+    let transient = NameId {
+        format: Some(constants::NAMEID_TRANSIENT.to_string()),
+        ..bsn_name_id(BSN)
+    };
     assert!(matches!(
         run(&Wire {
-            acting_subject: Some(encrypted_id_inline(DV_ENCRYPTION_CERT, DV, &transient)),
+            acting_subject: vec![encrypted_id(DV_ENCRYPTION_CERT, DV, &transient)],
             ..Wire::default()
         }),
         Err(NlEidError::InvalidDecryptedNameId { .. })
@@ -752,10 +786,7 @@ fn a_decrypted_name_id_of_the_wrong_shape_is_rejected() {
 fn an_encrypted_assertion_is_forbidden() {
     assert!(matches!(
         run(&Wire {
-            response_extra: format!(
-                r#"<saml:EncryptedAssertion><xenc:EncryptedData xmlns:xenc="{XENC}"><xenc:EncryptionMethod Algorithm="{}"/><xenc:CipherData><xenc:CipherValue>AA==</xenc:CipherValue></xenc:CipherData></xenc:EncryptedData></saml:EncryptedAssertion>"#,
-                constants::ENC_AES256_CBC
-            ),
+            encrypted_assertion: true,
             ..Wire::default()
         }),
         Err(NlEidError::EncryptedAssertionForbidden)
@@ -784,22 +815,9 @@ fn stale_messages_are_rejected() {
 fn a_replayed_assertion_is_rejected() {
     let cache = InMemoryReplayCache::new();
     let body = soap_artifact_response(&Wire::default());
-    let first = gamlastan::profiles::nl_eid::process_artifact_response(
-        &cfg(),
-        &body,
-        &rd_verifier(),
-        &dv_keys(),
-        &params(&cache),
-    );
+    let first = process(&cfg(), &body, &dv_keys(), &cache);
     assert!(first.unwrap().is_authenticated());
-    let second = gamlastan::profiles::nl_eid::process_artifact_response(
-        &cfg(),
-        &body,
-        &rd_verifier(),
-        &dv_keys(),
-        &params(&cache),
-    )
-    .unwrap_err();
+    let second = process(&cfg(), &body, &dv_keys(), &cache).unwrap_err();
     assert!(second.to_string().contains("replayed"), "{second}");
 }
 
@@ -811,14 +829,7 @@ fn a_weak_algorithm_anywhere_is_rejected_before_verification() {
         1,
     );
     let cache = InMemoryReplayCache::new();
-    let err = gamlastan::profiles::nl_eid::process_artifact_response(
-        &cfg(),
-        &body,
-        &rd_verifier(),
-        &dv_keys(),
-        &params(&cache),
-    )
-    .unwrap_err();
+    let err = process(&cfg(), &body, &dv_keys(), &cache).unwrap_err();
     assert!(
         matches!(err, NlEidError::DisallowedAlgorithm { kind: "digest", .. }),
         "{err}"
@@ -829,14 +840,7 @@ fn a_weak_algorithm_anywhere_is_rejected_before_verification() {
 fn garbage_from_the_back_channel_is_rejected() {
     let cache = InMemoryReplayCache::new();
     for body in ["502 Bad Gateway", "<html><body>proxy error</body></html>"] {
-        let err = gamlastan::profiles::nl_eid::process_artifact_response(
-            &cfg(),
-            body,
-            &rd_verifier(),
-            &dv_keys(),
-            &params(&cache),
-        )
-        .unwrap_err();
+        let err = process(&cfg(), body, &dv_keys(), &cache).unwrap_err();
         assert!(matches!(err, NlEidError::MalformedMessage(_)), "{err}");
     }
 }
@@ -848,11 +852,7 @@ fn dv_verifier() -> SamlVerifier {
     key.usage = KeyUsage::Verify;
     let mut km = KeysManager::new();
     km.add_key(key);
-    km.add_trusted_cert(
-        base64::engine::general_purpose::STANDARD
-            .decode(cert_der_b64(DV_SIGNING_CERT))
-            .unwrap(),
-    );
+    km.add_trusted_cert(cert_der(DV_SIGNING_CERT));
     SamlVerifier::new(km).with_algorithm_policy(constants::algorithm_policy())
 }
 
@@ -920,30 +920,48 @@ fn the_dv_metadata_is_signed_and_round_trips() {
     let result = dv_verifier().verify_enveloped(&xml).unwrap();
     assert!(result.is_valid(), "{result:?}");
     // The signature is the first child of the EntityDescriptor.
-    let root_end = xml.find('>').unwrap();
-    assert!(
-        xml[root_end..]
-            .trim_start_matches('>')
-            .starts_with("<ds:Signature"),
-        "{xml}"
-    );
+    let doc = gamlastan::xml::parse_secure_metadata(&xml).unwrap();
+    let root = doc.document_element().unwrap();
+    let first_child = doc
+        .children_iter(root)
+        .find(|c| doc.element(*c).is_some())
+        .unwrap();
+    assert!(doc
+        .element(first_child)
+        .unwrap()
+        .matches_name_ns(constants::NS_DS, "Signature"));
     assert!(xml.contains(&published(DV_ENCRYPTION_2_CERT).key_name));
 }
 
 #[test]
 fn a_logout_response_from_the_rd_validates() {
     let in_response_to = "_logout1";
-    let now = ts(Duration::zero());
-    let unsigned = format!(
-        r#"<samlp:LogoutResponse xmlns:samlp="{SAMLP}" xmlns:saml="{SAML}" ID="_lr1" Version="2.0" IssueInstant="{now}" Destination="{SLS}" InResponseTo="{in_response_to}"><saml:Issuer>{RD}</saml:Issuer><samlp:Status><samlp:StatusCode Value="{}"/></samlp:Status></samlp:LogoutResponse>"#,
-        constants::STATUS_SUCCESS
-    );
-    let signed = rd_sign(&unsigned, "_lr1", &Wire::default());
+    let response = LogoutResponse {
+        id: "_lr1".to_string(),
+        version: SamlVersion::V2_0,
+        issue_instant: Utc::now(),
+        destination: Some(SLS.to_string()),
+        consent: None,
+        issuer: Some(gamlastan::core::assertion::issuer::Issuer::entity(RD)),
+        has_signature: true,
+        in_response_to: Some(in_response_to.to_string()),
+        status: Status::success(),
+    };
+    let signed = sign_rd_element_xml(
+        &response.to_xml_string().unwrap(),
+        SAMLP,
+        "LogoutResponse",
+        "_lr1",
+        &signer(RD_SIGNING_KEY),
+        &rd_key_name(),
+    )
+    .unwrap();
     let outcome =
         validate_logout_response(&cfg(), &signed, &rd_verifier(), in_response_to, Utc::now())
             .unwrap();
     assert!(outcome.is_success());
     assert_eq!(outcome.in_response_to, in_response_to);
+    assert_eq!(outcome.rd_signing_key_name, rd_key_name());
 
     // Wrong correlation and wrong destination are rejected.
     assert!(matches!(
@@ -974,20 +992,27 @@ fn a_logout_response_from_the_rd_validates() {
         ),
         Err(NlEidError::InvalidSignature { .. })
     ));
+    // An unsigned response is refused.
+    assert!(matches!(
+        validate_logout_response(
+            &cfg(),
+            &response.to_xml_string().unwrap(),
+            &rd_verifier(),
+            in_response_to,
+            Utc::now()
+        ),
+        Err(NlEidError::MissingSignature("LogoutResponse"))
+    ));
 }
 
 #[test]
 fn sign_element_xml_places_an_assertion_signature_after_the_issuer() {
-    let assertion = assertion_xml(&Wire::default()).replacen(
-        "<saml:Assertion ",
-        &format!(r#"<saml:Assertion xmlns:saml="{SAML}" "#),
-        1,
-    );
+    let assertion = response_for(&Wire::default()).assertions.remove(0);
     let signed = sign_element_xml(
-        &assertion,
+        &assertion.to_xml_string().unwrap(),
         SAML,
         "Assertion",
-        "_assertion1",
+        ASSERTION_ID,
         &signer(RD_SIGNING_KEY),
         &cert_der_b64(RD_SIGNING_CERT),
     )
@@ -998,12 +1023,13 @@ fn sign_element_xml_places_an_assertion_signature_after_the_issuer() {
     assert!(issuer < sig && sig < subject);
     assert!(rd_verifier().verify_enveloped(&signed).unwrap().is_valid());
     // The same helper refuses an element that is not there.
-    assert!(sign_message_xml(
-        &assertion,
-        "Response",
-        "_assertion1",
+    assert!(sign_element_xml(
+        &assertion.to_xml_string().unwrap(),
+        SAML,
+        "Assertion",
+        "_not-there",
         &signer(RD_SIGNING_KEY),
-        "AA=="
+        &cert_der_b64(RD_SIGNING_CERT),
     )
     .is_err());
 }

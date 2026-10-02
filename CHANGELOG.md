@@ -18,14 +18,24 @@ where needed to correct protocol handling.
   rules, the section 9 algorithm allow-lists, ordered Levels of Assurance with
   `Comparison="minimum"`, `ServiceUUID` binding, and decryption of the
   `EncryptedID` identifiers addressed to the DV into zeroized `SubjectId`s),
-  the DV metadata document, an RD metadata reader, and `LogoutResponse`
-  validation. See ADR 0045.
+  the DV metadata document, an RD metadata reader, `LogoutResponse`
+  validation, and `nl_eid::rd`, which builds the RD-side messages from the
+  typed protocol structs for RD mocks and tests. See ADR 0045.
+- Added `xml::helpers::node_to_self_contained_xml`, which serializes a
+  subtree with the namespace declarations it inherits from its ancestors.
 - Added `zeroize` as a direct dependency for the decrypted identifiers.
 
 ### Changed
 
 - `profiles::sso::idp::insert_signature_after_issuer` is now crate-visible so
   other profiles can splice a signature template at the schema position.
+
+### Fixed
+
+- `bindings::soap::soap_envelope_unwrap` now returns a namespace-complete
+  `body_xml`: namespace prefixes the SAML message used but that were declared
+  on the SOAP `Envelope` or `Body` were previously left undeclared in the
+  extracted body.
 
 ## [0.9.1] - 2026-09-29
 

@@ -151,7 +151,10 @@ pub fn soap_envelope_unwrap(soap_xml: &[u8]) -> Result<SoapUnwrapped, BindingErr
         }
     }
 
-    let body_xml = doc.node_to_xml(body_children[0]);
+    // Namespace-complete even when the SAML prefixes are declared on the
+    // Envelope or Body rather than on the SAML element itself.
+    let body_xml = crate::xml::helpers::node_to_self_contained_xml(&doc, body_children[0])
+        .ok_or_else(|| BindingError::InvalidSoapEnvelope("invalid SOAP Body child".to_string()))?;
 
     Ok(SoapUnwrapped {
         body_xml,
@@ -266,6 +269,21 @@ mod tests {
         // The unwrapped body should contain the SAML element
         assert!(unwrapped.body_xml.contains("ArtifactResolve"));
         assert!(unwrapped.header_xml.is_none());
+    }
+
+    #[test]
+    fn test_soap_unwrap_body_inherits_envelope_namespaces() {
+        // The SAML prefixes are declared on the Envelope, not on the body
+        // element: the extracted body must still be a standalone document.
+        let envelope = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"><soap:Body><samlp:ArtifactResolve ID="_abc" Version="2.0" IssueInstant="2025-01-01T00:00:00Z"><saml:Issuer>sp</saml:Issuer><samlp:Artifact>AAQ=</samlp:Artifact></samlp:ArtifactResolve></soap:Body></soap:Envelope>"#;
+        let unwrapped = soap_envelope_unwrap(envelope.as_bytes()).unwrap();
+        let doc = crate::xml::parse_secure(&unwrapped.body_xml).expect("standalone body parses");
+        let root = doc.document_element().unwrap();
+        let elem = doc.element(root).unwrap();
+        assert!(elem.matches_name_ns("urn:oasis:names:tc:SAML:2.0:protocol", "ArtifactResolve"));
+        assert!(doc
+            .first_child_element_by_name_ns(root, "urn:oasis:names:tc:SAML:2.0:assertion", "Issuer")
+            .is_some());
     }
 
     #[test]

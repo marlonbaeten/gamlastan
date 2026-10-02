@@ -52,7 +52,8 @@ helpers, and a profile error type with a SAML status mapping.
 | `response.rs` | §7.6, §7.6.3.5, §9.2, §9.3 | `process_artifact_response` and `AuthnOutcome` |
 | `metadata.rs` | §8.3, §8.5 | DV metadata document; RD metadata reader and `KeyName`-keyed `KeysManager` |
 | `logout.rs` | §7.7.2 | `LogoutResponse` validation |
-| `xmlutil.rs` | — | Tree navigation, self-contained subtree serialization, signature structure checks, §9 algorithm scan |
+| `rd.rs` | §7.6, §7.8, §9.2, §9.3 | RD-side message construction from the typed structs (the counterpart of `swedenconnect::idp`) |
+| `xmlutil.rs` | — | Signature binding on top of `SamlVerifier`, §9 algorithm scan, freshness bounds, the few uppsala document operations the typed model cannot cover |
 
 The module name is `nl_eid` (after the identifier scheme `urn:nl-eid-gdi`)
 rather than the RD product name, so a deployment against another RD
@@ -60,36 +61,47 @@ implementation needs no rename.
 
 ## Consequences and the decisions inside the decision
 
-### 1. One parsed tree; signed sub-elements re-serialized self-contained
+### 1. Typed model first; the document tree only where the model is blind
 
-The chain is parsed once and navigated as a tree. When a sub-element must be
-handed to the verifier (the `Assertion`, or a `Response` that unexpectedly
-carries a signature) or the decryptor (an `EncryptedID`), it is re-serialized
-with `uppsala`'s `node_to_xml` **plus every namespace declaration it inherits
-from an ancestor** (`xmlutil::self_contained_xml`). `node_to_xml` alone treats
-ancestor bindings as in scope and omits them, which leaves a dangling prefix
-when an RD declares `saml`/`samlp` on the `ArtifactResponse` or the SOAP
-envelope. Exclusive canonicalization ignores declarations that are not visibly
-utilized, so the added declarations cannot change a digest; the integration
-test proves this by signing with the declarations on the element and verifying
-with them moved to the envelope.
+As in the Sweden Connect profile, messages are read through the crate's
+deserializers (`parse_saml`, `SamlDeserialize::from_xml`) and written through
+its serializers and `XmlWriter`; no profile code splices namespace
+declarations, cuts byte ranges or scans start tags. The document tree
+(`uppsala`) is consulted for exactly three things the typed model cannot
+carry: which `<ds:Signature>` element belongs to which SAML element, the
+`<ds:KeyName>` of a signature, and the `<saml:EncryptedID>` elements that must
+reach the decryptor byte-exact.
 
-The SOAP envelope is unwrapped the same way instead of through
-`bindings::soap::soap_envelope_unwrap`, whose `body_xml` has the dangling-prefix
-problem for envelope-level declarations.
+A subtree that has to leave the received document (an `EncryptedID`, or the
+SAML element inside a SOAP `Body`) is copied with `Document::import_subtree`
+into a fresh document and serialized from there. `node_to_xml` on the original
+treats ancestor namespace bindings as in scope and omits them, which leaves a
+dangling prefix when an RD declares `saml`/`samlp` on the `ArtifactResponse` or
+the SOAP envelope; the writer of a fresh document synthesizes every declaration
+the copied subtree needs. `xml::helpers::node_to_self_contained_xml` exposes
+this, and `bindings::soap::soap_envelope_unwrap` now uses it too, which fixes
+the same latent gap in its `body_xml`. Exclusive canonicalization ignores
+declarations that are not visibly utilized, so the moved declarations cannot
+change a digest; the integration test signs with the declarations on the
+element and verifies with them moved to the envelope.
 
-### 2. Every signature is enveloping, single, first, `KeyName`-selected and bound
+### 2. One verification pass over the received bytes; every consumed signature single, `KeyName`-selected and bound
 
-For each signed element the profile requires exactly one direct
-`<ds:Signature>` child that is also the first `<ds:Signature>` in the element's
-subtree (the verifier processes the first signature it meets, so a genuine
-signature nested earlier inside a forged wrapper would otherwise be the one
-verified), a `<ds:KeyInfo>/<ds:KeyName>` that names a key in the verifier's
-`KeysManager` (§9.2; bergshamra would fall back to the first trusted key), and
-verified references that cover the consumed element's `@ID` (ADR 0028). The
-assertion signature is verified on the assertion subtree alone, which is why
-the `<saml:Advice>` evidence assertion's AD signature is never checked against
-RD keys: it is evidence, not trust (§9.1).
+The received `ArtifactResponse` document is verified once with
+`SamlVerifier::verify_all_enveloped`, over the exact bytes it was parsed from.
+The verifier reports one result per `<ds:Signature>` in document order, which
+is the same order in which the tree enumerates them, so each verdict is
+attached to its `<ds:Signature>` element and through that to the element it is
+a child of. For each element the profile consumes (`ArtifactResponse`,
+`Assertion`, and a `Response` that unexpectedly carries a signature) it then
+requires exactly one direct `<ds:Signature>` child, a `<ds:KeyInfo>/<ds:KeyName>`
+that names a key in the verifier's `KeysManager` (§9.2; bergshamra would fall
+back to the first trusted key), and verified references that cover the
+element's `@ID` (ADR 0028). Signatures the profile does not consume, such as
+the AD's signature on the `<saml:Advice>` evidence assertion (§9.1), may be
+invalid against the RD keys: they are never looked at. Nothing is
+re-serialized for verification, so the bytes the RD signed are the bytes the
+verifier sees.
 
 ### 3. Assertion signature required by default, configurable
 
@@ -105,10 +117,10 @@ always verified and bound, never ignored.
 An `EncryptedID` may carry one `<xenc:EncryptedKey>` per recipient and per
 published encryption certificate, referenced either inline or through a
 `<ds:RetrievalMethod>`. The profile selects the `EncryptedID` whose
-`EncryptedKey/@Recipient` is this DV, removes every other recipient's
-`EncryptedKey` (and `RetrievalMethod`s pointing at them) from the standalone
-serialization, and only then decrypts, so the backend can never pick a foreign
-key. The §9.1 / §9.3 algorithm scan also skips `EncryptedKey`s wrapped for
+`EncryptedKey/@Recipient` is this DV, copies it into a standalone document,
+detaches every other recipient's `EncryptedKey` (and the `RetrievalMethod`s
+pointing at them) from that copy with the DOM, and only then serializes and
+decrypts, so the backend can never pick a foreign key. The §9.1 / §9.3 algorithm scan also skips `EncryptedKey`s wrapped for
 other recipients, as §7.6.3.4 says they SHOULD be ignored. The XML Encryption
 backend uses the first RSA private key of its key manager, so
 `DvDecryptionKeys` holds one `SamlDecryptor` per DV encryption key and tries
@@ -146,18 +158,21 @@ Recorded so the profile's boundary is unambiguous:
   browser to its flow stay with the application.
 - **The LC role** (§6.3, §8.4) — not modelled; `IntendedAudience` is
   configurable so an LC layer can be added without an API break.
-- **RD-side construction** — gamlastan is the DV here; test messages are
-  built in the integration test, not by a public RD module.
+- **The RD role** — gamlastan is the DV here. `nl_eid::rd` builds the RD's
+  messages from the typed structs so RD mocks and this crate's tests do not
+  hand-write XML, but it is not an RD implementation: artifact issuance and
+  the RD's own validation of DV requests are out of scope.
 
 ## Validation
 
 - `cargo fmt --all -- --check`, `cargo clippy -p gamlastan --all-targets -- -D warnings` — clean.
 - `cargo test -p gamlastan` — the module's unit tests plus
   `tests/nl_eid_artifact_flow.rs`, which builds RD-signed SOAP
-  `ArtifactResponse`s with dedicated test keys (`tests/fixtures/nl_eid/`) and
-  covers: the happy path, SAML namespaces declared on the SOAP envelope, the
-  TVS `RetrievalMethod` + sibling `EncryptedKey` layout, keys for another
-  recipient, encryption-key rollover, the assertion-signature policy,
+  `ArtifactResponse`s through `nl_eid::rd` with dedicated test keys
+  (`tests/fixtures/nl_eid/`) and covers: the happy path, SAML namespaces
+  declared on the SOAP envelope, the TVS `RetrievalMethod` + sibling
+  `EncryptedKey` layout, a `LegalSubjectID`, keys for another recipient,
+  encryption-key rollover, the assertion-signature policy,
   cancellation and RD error statuses, a denied artifact resolution, wrong
   `InResponseTo` at every level, an unknown and a mismatched RD key, a
   signature-wrapping attempt, a foreign audience, LoA below the minimum and
@@ -169,9 +184,16 @@ Recorded so the profile's boundary is unambiguous:
 
 ## Alternatives considered
 
-- **Verify every signature in the document with `verify_all_enveloped`.**
-  Rejected: the `<saml:Advice>` carries the AD's assertion with its own
-  signature by a key the DV does not trust, so the whole message would fail.
+- **Re-serialize each signed sub-element and verify it alone with
+  `verify_enveloped`.** This was the first implementation. Rejected in favour
+  of one `verify_all_enveloped` pass over the received bytes with per-element
+  binding: it needed the profile to splice inherited namespace declarations
+  into the re-serialized element by hand, the kind of custom XML handling
+  the module exists to retire, and it verified bytes the RD never signed.
+- **Fail the message when any signature in it is invalid.** Rejected: the
+  `<saml:Advice>` carries the AD's assertion with its own signature by a key
+  the DV does not trust. Only the signatures of consumed elements are
+  required to verify.
 - **Return the decrypted identifiers as plain `String`s.** Rejected in favour
   of a zeroizing, redacting type; the one dependency is small and already in
   the tree.

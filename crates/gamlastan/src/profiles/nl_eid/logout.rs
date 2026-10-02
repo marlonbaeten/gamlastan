@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use crate::core::protocol::logout::LogoutResponseRef;
 use crate::core::protocol::status::Status;
 use crate::crypto::SamlVerifier;
-use crate::xml::deserialize::SamlDeserialize;
+use crate::xml::deserialize::parse_saml;
 
 use super::config::NlEidConfig;
 use super::constants;
@@ -37,8 +37,8 @@ impl LogoutResponseOutcome {
 
 /// Validate the decoded (HTTP-POST `SAMLResponse`) `LogoutResponse` XML per
 /// §7.7.2: root `samlp:LogoutResponse`, §9.1 algorithms, the enveloping RD
-/// signature (single, first, `KeyName`-selected, bound to the element),
-/// `Version` 2.0, fresh `IssueInstant`, `Issuer` = RD, `Destination` = the DV
+/// signature (single, `KeyName`-selected, bound to the element), `Version`
+/// 2.0, fresh `IssueInstant`, `Issuer` = RD, `Destination` = the DV
 /// `SingleLogoutService` URL, and `InResponseTo` = `expected_in_response_to`.
 ///
 /// A failure status is not an error: the outcome reports it. The local
@@ -67,10 +67,11 @@ pub fn validate_logout_response(
         ));
     }
     xmlutil::validate_algorithms(&doc, root, None)?;
+    let signatures = xmlutil::verify_document_signatures(&doc, xml, verifier, "LogoutResponse")?;
     let signature =
-        xmlutil::verify_enveloping_signature(&doc, root, xml, verifier, "LogoutResponse")?;
+        xmlutil::require_signed_element(&doc, &signatures, root, "LogoutResponse", verifier)?;
 
-    let response = LogoutResponseRef::from_xml(&doc, root)?.to_owned();
+    let response = parse_saml::<LogoutResponseRef<'_>>(&doc)?.to_owned();
     if !response.version.is_v2_0() {
         return Err(NlEidError::MalformedMessage(
             "LogoutResponse Version is not 2.0".to_string(),
