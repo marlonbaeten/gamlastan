@@ -474,6 +474,101 @@ impl RdMetadata {
         Ok(SamlVerifier::new(self.keys_manager()?)
             .with_algorithm_policy(constants::algorithm_policy()))
     }
+
+    /// Keep only the signing certificates `keep` accepts: the deployment's
+    /// trust filter (§9.1 / §9.2: the PKIoverheid chain and the participant OIN
+    /// in the certificate subject). Errors when no certificate survives, so a
+    /// document whose keys are all untrusted can never be used.
+    pub fn retain_signing_keys(
+        &mut self,
+        mut keep: impl FnMut(&RdSigningKey) -> bool,
+    ) -> Result<(), NlEidError> {
+        self.signing_keys.retain(|key| keep(key));
+        if self.signing_keys.is_empty() {
+            return Err(NlEidError::Metadata(
+                "no RD signing certificate passed the trust filter".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verify the enveloped signature of the metadata document `xml` this
+    /// descriptor was read from against [`signing_keys`](Self::signing_keys)
+    /// (§8.2, §9.2): §9.1 algorithms, exactly one `<ds:Signature>` child of the
+    /// `<md:EntityDescriptor>`, its `<ds:KeyName>` naming one of these keys,
+    /// and verified references covering the document element. Returns the
+    /// `KeyName` of the key that signed.
+    ///
+    /// Call this after [`retain_signing_keys`](Self::retain_signing_keys): a
+    /// signature by a key the deployment does not trust must not verify.
+    pub fn verify_signature(&self, xml: &str) -> Result<String, NlEidError> {
+        let doc = crate::xml::parse_secure_metadata(xml)?;
+        let root = doc
+            .document_element()
+            .ok_or_else(|| NlEidError::MalformedMessage("empty document".to_string()))?;
+        if !xmlutil::is_element(&doc, root, constants::NS_MD, "EntityDescriptor") {
+            return Err(NlEidError::MalformedMessage(
+                "document is not an md:EntityDescriptor".to_string(),
+            ));
+        }
+        xmlutil::validate_algorithms(&doc, root, None)?;
+        let verifier = self.verifier()?;
+        let signatures =
+            xmlutil::verify_document_signatures(&doc, xml, &verifier, "EntityDescriptor")?;
+        let signature = xmlutil::require_signed_element(
+            &doc,
+            &signatures,
+            root,
+            "EntityDescriptor",
+            &verifier,
+        )?;
+        Ok(signature.key_name)
+    }
+
+    /// [`cache_duration`](Self::cache_duration) as a duration, when present
+    /// and parseable (see [`parse_xs_duration`]).
+    pub fn cache_duration_std(&self) -> Option<std::time::Duration> {
+        self.cache_duration.as_deref().and_then(parse_xs_duration)
+    }
+}
+
+/// Parse an XML Schema duration (e.g. `PT24H`, `P1D`, `PT1H30M`) into a
+/// [`std::time::Duration`]. Supports days and weeks in the date part and
+/// hours, minutes and seconds in the time part, which covers SAML metadata
+/// `cacheDuration` values; returns `None` for fractional, year/month or
+/// otherwise unsupported forms.
+pub fn parse_xs_duration(s: &str) -> Option<std::time::Duration> {
+    fn accumulate(part: &str, in_time: bool, secs: &mut u64) -> Option<()> {
+        let mut num = String::new();
+        for c in part.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let n: u64 = num.parse().ok()?;
+            num.clear();
+            let unit: u64 = match (in_time, c) {
+                (false, 'D') => 86_400,
+                (false, 'W') => 604_800,
+                (true, 'H') => 3_600,
+                (true, 'M') => 60,
+                (true, 'S') => 1,
+                _ => return None,
+            };
+            *secs = secs.checked_add(n.checked_mul(unit)?)?;
+        }
+        num.is_empty().then_some(())
+    }
+
+    let body = s.trim().strip_prefix('P')?;
+    let (date_part, time_part) = body.split_once('T').unwrap_or((body, ""));
+    if date_part.is_empty() && time_part.is_empty() {
+        return None;
+    }
+    let mut secs = 0u64;
+    accumulate(date_part, false, &mut secs)?;
+    accumulate(time_part, true, &mut secs)?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 fn single_idp_descriptor(ed: &EntityDescriptor) -> Result<&IdpSsoDescriptor, NlEidError> {
@@ -670,6 +765,53 @@ mod tests {
         let km = rd.keys_manager().unwrap();
         assert!(km.find_by_name(&published.key_name).is_some());
         assert!(rd.verifier().is_ok());
+    }
+
+    #[test]
+    fn test_parse_xs_duration_handles_common_forms() {
+        use std::time::Duration;
+        assert_eq!(
+            parse_xs_duration("PT24H"),
+            Some(Duration::from_secs(86_400))
+        );
+        assert_eq!(parse_xs_duration("P1D"), Some(Duration::from_secs(86_400)));
+        assert_eq!(parse_xs_duration("P1W"), Some(Duration::from_secs(604_800)));
+        assert_eq!(
+            parse_xs_duration("PT1H30M"),
+            Some(Duration::from_secs(5_400))
+        );
+        assert_eq!(parse_xs_duration("PT30S"), Some(Duration::from_secs(30)));
+        assert_eq!(
+            parse_xs_duration(" P1DT1H "),
+            Some(Duration::from_secs(90_000))
+        );
+        for bad in ["P1Y", "P1M", "24H", "PT1.5H", "P", "PT", "PT1", "", "X"] {
+            assert_eq!(parse_xs_duration(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_retain_signing_keys_fails_closed() {
+        let cert_pem = include_str!("../../../tests/fixtures/enc-cert.pem");
+        let published = PublishedCertificate::from_pem(cert_pem).unwrap();
+        let xml = rd_metadata_xml(&published.key_info_xml(), r#"cacheDuration="PT1H""#, true);
+        let mut rd = parse_rd_metadata(&xml).unwrap();
+        assert_eq!(
+            rd.cache_duration_std(),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert!(rd.retain_signing_keys(|_| true).is_ok());
+        assert!(matches!(
+            rd.retain_signing_keys(|_| false),
+            Err(NlEidError::Metadata(_))
+        ));
+        // The signing key list is empty afterwards, so no verifier can be built
+        // that accepts anything.
+        assert!(rd.signing_keys.is_empty());
+        assert!(matches!(
+            rd.verify_signature(&xml),
+            Err(NlEidError::MissingSignature("EntityDescriptor"))
+        ));
     }
 
     #[test]

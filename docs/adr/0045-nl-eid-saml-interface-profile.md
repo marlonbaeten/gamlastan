@@ -148,14 +148,20 @@ lets the embedding application end its local session on a genuine failed login
 Recorded so the profile's boundary is unambiguous:
 
 - **Trust in the RD metadata** — `parse_rd_metadata` reads endpoints and
-  signing keys; verifying the metadata signature, the PKIoverheid chain and
-  the OIN in the certificate subject (§9.1, §9.2), and pinning the endpoint
-  hosts, remain with the deployment.
+  signing keys without establishing trust. The deployment decides which
+  certificates it trusts (the PKIoverheid chain and the OIN in the
+  certificate subject, §9.1, §9.2) through `RdMetadata::retain_signing_keys`,
+  after which `RdMetadata::verify_signature` checks the document's enveloped
+  signature against exactly those keys with the same single, `KeyName`-
+  selected, root-bound rules as the messages. Pinning the endpoint hosts
+  remains with the deployment.
 - **Transport** — the mutual-TLS SOAP back-channel (§9.4) and the HTTP-POST
   auto-submit page.
 - **Pending-request store** — the profile matches `InResponseTo` against the
-  request IDs the caller supplies; consuming them once (§9.7) and binding the
-  browser to its flow stay with the application.
+  request IDs the caller supplies (for a `LogoutResponse` the expectation is
+  optional, as a store keyed by request ID learns the ID from the verified
+  response); consuming them once (§9.7) and binding the browser to its flow
+  stay with the application.
 - **The LC role** (§6.3, §8.4) — not modelled; `IntendedAudience` is
   configurable so an LC layer can be added without an API break.
 - **The RD role** — gamlastan is the DV here. `nl_eid::rd` builds the RD's

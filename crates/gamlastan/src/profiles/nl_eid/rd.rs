@@ -469,6 +469,27 @@ pub fn sign_rd_element_xml(
     Ok(signer.sign_enveloped(&with_template)?)
 }
 
+/// Sign an RD metadata document (`<md:EntityDescriptor ID="id">`) as the RD
+/// does (§8.2): the [`rd_signature_template`] with a `KeyName`-only `KeyInfo`
+/// becomes the first child of the document element.
+pub fn sign_rd_metadata_xml(
+    xml: &str,
+    id: &str,
+    signer: &SamlSigner,
+    key_name: &str,
+) -> Result<String, NlEidError> {
+    let method = signer.signature_method_uri()?;
+    if !constants::is_allowed_signature_algorithm(method) {
+        return Err(NlEidError::DisallowedAlgorithm {
+            kind: "signature",
+            uri: method.to_string(),
+        });
+    }
+    let template = rd_signature_template(id, key_name, method);
+    let with_template = super::xmlutil::insert_signature_as_first_child(xml, &template)?;
+    Ok(signer.sign_enveloped(&with_template)?)
+}
+
 /// Serialize an `ArtifactResponse` and sign it as the RD does: first the
 /// `Assertion` with `@ID` `assertion_id` (if any, §7.6.3), then the enveloping
 /// `ArtifactResponse` (§7.6.1), so the outer signature covers the inner one.

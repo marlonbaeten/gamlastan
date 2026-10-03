@@ -74,8 +74,8 @@ pub use entity_id::{EidEntityId, ParticipantRole};
 pub use error::NlEidError;
 pub use logout::{validate_logout_response, LogoutResponseOutcome};
 pub use metadata::{
-    build_dv_metadata, key_name_for_certificate, parse_rd_metadata, DvMetadataOptions,
-    PublishedCertificate, RdMetadata, RdSigningKey,
+    build_dv_metadata, key_name_for_certificate, parse_rd_metadata, parse_xs_duration,
+    DvMetadataOptions, PublishedCertificate, RdMetadata, RdSigningKey,
 };
 pub use request::{
     build_artifact_resolve, build_authn_request, build_logout_request, check_artifact_param,

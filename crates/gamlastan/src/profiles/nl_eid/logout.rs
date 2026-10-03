@@ -39,7 +39,14 @@ impl LogoutResponseOutcome {
 /// §7.7.2: root `samlp:LogoutResponse`, §9.1 algorithms, the enveloping RD
 /// signature (single, `KeyName`-selected, bound to the element), `Version`
 /// 2.0, fresh `IssueInstant`, `Issuer` = RD, `Destination` = the DV
-/// `SingleLogoutService` URL, and `InResponseTo` = `expected_in_response_to`.
+/// `SingleLogoutService` URL, and a present `InResponseTo`.
+///
+/// With `expected_in_response_to` the `InResponseTo` MUST equal it. A caller
+/// whose pending-request store is keyed by the ID (so it does not know which
+/// `LogoutRequest` is being answered before reading the response) passes
+/// `None` and consumes [`LogoutResponseOutcome::in_response_to`] afterwards;
+/// the outcome is only returned once the RD signature verified, so a forged
+/// response cannot burn a pending ID.
 ///
 /// A failure status is not an error: the outcome reports it. The local
 /// session is already gone by the time this runs, so the caller logs the
@@ -48,7 +55,7 @@ pub fn validate_logout_response(
     cfg: &NlEidConfig,
     xml: &str,
     verifier: &SamlVerifier,
-    expected_in_response_to: &str,
+    expected_in_response_to: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<LogoutResponseOutcome, NlEidError> {
     cfg.validate()?;
@@ -102,13 +109,14 @@ pub fn validate_logout_response(
             expected: sls_url.to_string(),
         });
     }
-    let in_response_to = match response.in_response_to.as_deref() {
-        Some(irt) if irt == expected_in_response_to => irt.to_string(),
-        received => {
+    let in_response_to = match (response.in_response_to.as_deref(), expected_in_response_to) {
+        (Some(irt), None) if !irt.trim().is_empty() => irt.to_string(),
+        (Some(irt), Some(expected)) if irt == expected => irt.to_string(),
+        (received, expected) => {
             return Err(NlEidError::InResponseToMismatch {
                 element: "LogoutResponse",
                 received: received.map(str::to_string),
-                expected: expected_in_response_to.to_string(),
+                expected: expected.unwrap_or("<any LogoutRequest ID>").to_string(),
             })
         }
     };

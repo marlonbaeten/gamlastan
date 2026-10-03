@@ -22,8 +22,8 @@ use gamlastan::crypto::{KeyUsage, KeysManager, SamlSigner, SamlVerifier};
 use gamlastan::profiles::nl_eid::rd::{
     cancel_status, create_artifact_response, create_artifact_response_error, create_error_response,
     create_response, encrypt_subject_id, encrypted_id_attribute_value, request_denied_status,
-    request_unsupported_status, sign_rd_element_xml, signed_artifact_response_xml,
-    RdResponseOptions, RdSubject,
+    request_unsupported_status, sign_rd_element_xml, sign_rd_metadata_xml,
+    signed_artifact_response_xml, RdResponseOptions, RdSubject,
 };
 use gamlastan::profiles::nl_eid::{
     build_dv_metadata, constants, parse_rd_metadata, sign_element_xml, signed_artifact_resolve,
@@ -904,6 +904,57 @@ fn the_signed_authn_request_and_artifact_resolve_verify_against_the_dv_certifica
 }
 
 #[test]
+fn rd_metadata_is_trust_filtered_and_its_signature_verified() {
+    // The RD signs its metadata with a key it also publishes in it. The DV
+    // keeps only the keys its deployment trusts and then verifies the document
+    // against exactly those.
+    let unsigned = rd_metadata_xml(RD_SIGNING_CERT);
+    let signed = sign_rd_metadata_xml(
+        &unsigned,
+        "_rdmeta",
+        &signer(RD_SIGNING_KEY),
+        &rd_key_name(),
+    )
+    .unwrap();
+    let mut rd = parse_rd_metadata(&signed).unwrap();
+    assert_eq!(rd.signing_keys.len(), 1);
+    assert_eq!(rd.verify_signature(&signed).unwrap(), rd_key_name());
+
+    // A tampered document fails.
+    let tampered = signed.replacen("https://rd.example/ars", "https://evil.example/ars", 1);
+    assert!(matches!(
+        rd.verify_signature(&tampered),
+        Err(NlEidError::InvalidSignature { .. })
+    ));
+    // The unsigned document fails.
+    assert!(matches!(
+        rd.verify_signature(&unsigned),
+        Err(NlEidError::MissingSignature("EntityDescriptor"))
+    ));
+    // A deployment trust filter that rejects the key leaves nothing to verify
+    // with, and the filter itself fails closed.
+    assert!(matches!(
+        rd.retain_signing_keys(|key| key.cert_der != cert_der(RD_SIGNING_CERT)),
+        Err(NlEidError::Metadata(_))
+    ));
+
+    // A document published with one key but signed by another the DV does not
+    // hold is refused before any cryptography: the KeyName is unknown.
+    let foreign = sign_rd_metadata_xml(
+        &unsigned,
+        "_rdmeta",
+        &signer(DV_SIGNING_KEY),
+        &published(DV_SIGNING_CERT).key_name,
+    )
+    .unwrap();
+    let rd = parse_rd_metadata(&foreign).unwrap();
+    assert!(matches!(
+        rd.verify_signature(&foreign),
+        Err(NlEidError::UnknownSigningKey(_))
+    ));
+}
+
+#[test]
 fn the_dv_metadata_is_signed_and_round_trips() {
     let mut opts = DvMetadataOptions::from_config(&cfg(), "Kiesraad");
     opts.signing_certificates = vec![published(DV_SIGNING_CERT)];
@@ -956,16 +1007,25 @@ fn a_logout_response_from_the_rd_validates() {
         &rd_key_name(),
     )
     .unwrap();
-    let outcome =
-        validate_logout_response(&cfg(), &signed, &rd_verifier(), in_response_to, Utc::now())
-            .unwrap();
+    let outcome = validate_logout_response(
+        &cfg(),
+        &signed,
+        &rd_verifier(),
+        Some(in_response_to),
+        Utc::now(),
+    )
+    .unwrap();
     assert!(outcome.is_success());
     assert_eq!(outcome.in_response_to, in_response_to);
     assert_eq!(outcome.rd_signing_key_name, rd_key_name());
+    // Without an expectation the caller correlates afterwards.
+    let outcome =
+        validate_logout_response(&cfg(), &signed, &rd_verifier(), None, Utc::now()).unwrap();
+    assert_eq!(outcome.in_response_to, in_response_to);
 
     // Wrong correlation and wrong destination are rejected.
     assert!(matches!(
-        validate_logout_response(&cfg(), &signed, &rd_verifier(), "_other", Utc::now()),
+        validate_logout_response(&cfg(), &signed, &rd_verifier(), Some("_other"), Utc::now()),
         Err(NlEidError::InResponseToMismatch { .. })
     ));
     let mut other_sls = cfg();
@@ -975,7 +1035,7 @@ fn a_logout_response_from_the_rd_validates() {
             &other_sls,
             &signed,
             &rd_verifier(),
-            in_response_to,
+            Some(in_response_to),
             Utc::now()
         ),
         Err(NlEidError::DestinationMismatch { .. })
@@ -987,7 +1047,7 @@ fn a_logout_response_from_the_rd_validates() {
             &cfg(),
             &tampered,
             &rd_verifier(),
-            in_response_to,
+            Some(in_response_to),
             Utc::now()
         ),
         Err(NlEidError::InvalidSignature { .. })
@@ -998,7 +1058,7 @@ fn a_logout_response_from_the_rd_validates() {
             &cfg(),
             &response.to_xml_string().unwrap(),
             &rd_verifier(),
-            in_response_to,
+            Some(in_response_to),
             Utc::now()
         ),
         Err(NlEidError::MissingSignature("LogoutResponse"))

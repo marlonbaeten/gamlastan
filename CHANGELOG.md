@@ -20,7 +20,12 @@ where needed to correct protocol handling.
   `EncryptedID` identifiers addressed to the DV into zeroized `SubjectId`s),
   the DV metadata document, an RD metadata reader, `LogoutResponse`
   validation, and `nl_eid::rd`, which builds the RD-side messages from the
-  typed protocol structs for RD mocks and tests. See ADR 0045.
+  typed protocol structs for RD mocks and tests. `RdMetadata` offers
+  `retain_signing_keys` (the deployment's trust filter), `verify_signature`
+  (the document's enveloped RD signature against the retained keys) and
+  `cache_duration_std`; `validate_logout_response` takes an optional expected
+  `InResponseTo` so a store keyed by request ID can correlate afterwards. See
+  ADR 0045.
 - Added `xml::helpers::node_to_self_contained_xml`, which serializes a
   subtree with the namespace declarations it inherits from its ancestors.
 - Added `zeroize` as a direct dependency for the decrypted identifiers.
