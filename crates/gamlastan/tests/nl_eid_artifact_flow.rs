@@ -852,7 +852,6 @@ fn dv_verifier() -> SamlVerifier {
     key.usage = KeyUsage::Verify;
     let mut km = KeysManager::new();
     km.add_key(key);
-    km.add_trusted_cert(cert_der(DV_SIGNING_CERT));
     SamlVerifier::new(km).with_algorithm_policy(constants::algorithm_policy())
 }
 

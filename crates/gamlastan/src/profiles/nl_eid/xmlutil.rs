@@ -564,9 +564,7 @@ mod tests {
             .with_name("k1");
         cert.usage = crate::crypto::KeyUsage::Verify;
         let mut verifying = crate::crypto::KeysManager::new();
-        let cert_der = cert.x509_chain.first().cloned().unwrap();
         verifying.add_key(cert);
-        verifying.add_trusted_cert(cert_der);
         let result = SamlVerifier::new(verifying)
             .verify_enveloped(&signed)
             .unwrap();

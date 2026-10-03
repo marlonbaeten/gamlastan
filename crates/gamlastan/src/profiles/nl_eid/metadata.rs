@@ -451,9 +451,15 @@ impl RdMetadata {
     }
 
     /// A `KeysManager` holding exactly the RD signing certificates, each as a
-    /// verification key named by its `<ds:KeyName>` and as a trust anchor, so
+    /// verification key named by its `<ds:KeyName>`, so
     /// `<ds:KeyInfo>/<ds:KeyName>` in RD signatures resolves to the right key
-    /// (§9.2) and nothing else verifies.
+    /// (§9.2) and, with the verifier's trusted-keys-only mode, nothing else
+    /// verifies.
+    ///
+    /// The certificates are *keys*, not X.509 trust anchors: trust in them was
+    /// established by the metadata (and the deployment's chain and OIN checks,
+    /// see [`retain_signing_keys`](Self::retain_signing_keys)), and RD
+    /// certificates are CA-issued leaves, which a trust anchor must not be.
     pub fn keys_manager(&self) -> Result<KeysManager, NlEidError> {
         let mut km = KeysManager::new();
         for key in &self.signing_keys {
@@ -462,7 +468,6 @@ impl RdMetadata {
                 .with_name(key.key_name.clone());
             k.usage = KeyUsage::Verify;
             km.add_key(k);
-            km.add_trusted_cert(key.cert_der.clone());
         }
         Ok(km)
     }
