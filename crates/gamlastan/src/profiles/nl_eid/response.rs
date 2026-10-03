@@ -405,10 +405,17 @@ pub fn validate_response(
         assertion_id: assertion.id.clone(),
         response_id: response.base.id.clone(),
     };
+    // The RD pretty-prints its messages, so element text may carry the
+    // indentation of the closing tag.
+    let authenticating_authorities = authn
+        .authenticating_authorities
+        .iter()
+        .map(|a| a.trim().to_string())
+        .collect();
     Ok(ResponseVerdict::Valid(Box::new(ValidatedAssertion {
         transient_name_id,
         level_of_assurance,
-        authenticating_authorities: authn.authenticating_authorities.clone(),
+        authenticating_authorities,
         authn,
     })))
 }
